@@ -43,6 +43,19 @@ class CreditLedgerEntryCreate(BaseModel):
     bill_file_url: str | None = None
 
 
+# Attaches/replaces/clears the bill on an EXISTING ledger entry — the entry
+# itself (amount/date/reason) is immutable once recorded, but a credit
+# entered from the Fuel Entry screen can only ever carry an amount + reason
+# (that screen has no bill upload of its own), so the manager comes back
+# here afterward to attach the physical bill against that specific entry.
+# Both fields together (attach/replace) or both null (clear) — never one
+# without the other, so a row can never end up with a name but no key or a
+# key but no name.
+class CreditLedgerEntryBillUpdate(BaseModel):
+    bill_file_name: str | None = None
+    bill_file_url: str | None = None
+
+
 class CreditLedgerEntryOut(ORMModel):
     id: uuid.UUID
     date: date

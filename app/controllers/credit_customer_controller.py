@@ -9,6 +9,7 @@ from app.schemas.credit_customer import (
     CreditCustomerCreate,
     CreditCustomerOut,
     CreditCustomerUpdate,
+    CreditLedgerEntryBillUpdate,
     CreditLedgerEntryCreate,
 )
 from app.services.credit_customer_service import CreditCustomerService
@@ -78,6 +79,19 @@ async def add_ledger_entry(
 ) -> CreditCustomerOut:
     service = CreditCustomerService(session)
     customer = await service.add_ledger_entry(customer_id, body, current_user)
+    return CreditCustomerOut.model_validate(customer)
+
+
+@router.patch("/{customer_id}/ledger/{entry_id}/bill", response_model=CreditCustomerOut)
+async def update_ledger_entry_bill(
+    customer_id: uuid.UUID,
+    entry_id: uuid.UUID,
+    body: CreditLedgerEntryBillUpdate,
+    current_user: User = Depends(require_manager_or_admin),
+    session: AsyncSession = Depends(get_db_session),
+) -> CreditCustomerOut:
+    service = CreditCustomerService(session)
+    customer = await service.update_ledger_entry_bill(customer_id, entry_id, body, current_user)
     return CreditCustomerOut.model_validate(customer)
 
 

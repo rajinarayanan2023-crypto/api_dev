@@ -8,7 +8,12 @@ from app.core.s3 import delete_object
 from app.models.credit import CreditCustomer, CreditCustomerBill, CreditLedgerEntry
 from app.models.user import User
 from app.repositories.credit_customer_repository import CreditCustomerRepository
-from app.schemas.credit_customer import CreditCustomerCreate, CreditCustomerUpdate, CreditLedgerEntryCreate
+from app.schemas.credit_customer import (
+    CreditCustomerCreate,
+    CreditCustomerUpdate,
+    CreditLedgerEntryBillUpdate,
+    CreditLedgerEntryCreate,
+)
 from app.services.audit import attach_actor_names
 
 
@@ -133,6 +138,22 @@ class CreditCustomerService:
         customer.ledger_entries.append(entry)
         customer.updated_by = actor.id
         await self.session.flush()
+        return await self.get(customer_id)
+
+    async def update_ledger_entry_bill(
+        self, customer_id: uuid.UUID, entry_id: uuid.UUID, data: CreditLedgerEntryBillUpdate, actor: User
+    ) -> CreditCustomer:
+        entry = await self.customers.get_ledger_entry(entry_id)
+        if entry is None or entry.customer_id != customer_id:
+            raise NotFoundError("Ledger entry not found.")
+        old_key = entry.bill_file_url
+        entry.bill_file_name = data.bill_file_name
+        entry.bill_file_url = data.bill_file_url
+        customer = await self.customers.get_with_details(customer_id)
+        customer.updated_by = actor.id
+        await self.session.flush()
+        if old_key and old_key != entry.bill_file_url:
+            delete_object(old_key)
         return await self.get(customer_id)
 
     # Mirrors the UI's own rule (see CreditBills.jsx) — an entry created from
