@@ -31,3 +31,29 @@ def get_sms_provider() -> SmsProvider:
         f"No SmsProvider implemented for SMS_PROVIDER={settings.sms_provider!r} yet — "
         "add one to app/core/sms.py."
     )
+
+
+class WhatsAppProvider(ABC):
+    @abstractmethod
+    async def send(self, to_phone: str | None, message: str) -> None: ...
+
+
+class DevLogWhatsAppProvider(WhatsAppProvider):
+    """Same stand-in as DevLogSmsProvider above — no WhatsApp Business API
+    account exists yet, so this just logs. Offer sends used to open a wa.me
+    deep link client-side instead of a real send; that only works for one
+    recipient at a time, which doesn't fit a bulk send with per-recipient
+    tracking, so it's replaced by this (also-not-real-yet) server-side path.
+    """
+
+    async def send(self, to_phone: str | None, message: str) -> None:
+        logger.warning("DEV WhatsApp to %s: %s", to_phone or "(no phone on file)", message)
+
+
+def get_whatsapp_provider() -> WhatsAppProvider:
+    if settings.sms_provider == "dev":
+        return DevLogWhatsAppProvider()
+    raise NotImplementedError(
+        f"No WhatsAppProvider implemented for SMS_PROVIDER={settings.sms_provider!r} yet — "
+        "add one to app/core/sms.py."
+    )

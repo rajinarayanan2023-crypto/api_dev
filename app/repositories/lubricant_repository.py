@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,6 +16,12 @@ _WITH_HISTORY = (
 class LubricantRepository(BaseRepository[LubricantProduct]):
     def __init__(self, session: AsyncSession):
         super().__init__(LubricantProduct, session)
+
+    async def get_by_name_ci(self, name: str) -> LubricantProduct | None:
+        result = await self.session.execute(
+            select(LubricantProduct).where(func.lower(LubricantProduct.name) == name.strip().lower())
+        )
+        return result.scalars().first()
 
     async def get_with_history(self, id: uuid.UUID) -> LubricantProduct | None:
         result = await self.session.execute(

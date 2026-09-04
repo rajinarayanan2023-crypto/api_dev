@@ -43,25 +43,34 @@ class Settings(BaseSettings):
     rate_limit_default: str = "100/minute"
 
     # --- Login OTP ---
+    # Expiry/max-attempts live in app/core/otp_store.py (in-memory, not DB
+    # config) since they're not meant to be tuned per-deployment.
     otp_length: int = 6
-    otp_expire_minutes: int = 5
-    otp_max_attempts: int = 5
     # "dev" logs the OTP server-side instead of sending a real SMS — no
     # provider account exists yet. See app/core/sms.py.
     sms_provider: str = "dev"
-    # Temporary bypass switch: set to false to skip the OTP step entirely
-    # (see AuthService.login_without_otp) while it's not fully wired to a
-    # real SMS provider yet. Flip back to true to restore the OTP flow with
-    # no code changes.
-    otp_enabled: bool = True
 
     # --- File uploads ---
-    # Local-disk storage for bill photos/documents (see UploadController) —
-    # a stopgap until this moves to real object storage (S3/R2/etc.) if the
-    # app ever runs on more than one server. Files land here and are served
-    # back out at /uploads/<filename> (see app/main.py's StaticFiles mount).
+    # Local-disk storage (see app/main.py's StaticFiles mount) is now only a
+    # fallback for bills uploaded before the R2 move — every new upload goes
+    # straight to Cloudflare R2 via a presigned URL (see app/core/s3.py,
+    # upload_controller.py).
     upload_dir: str = "uploads"
     upload_max_size_mb: int = 10
+
+    # --- File uploads (Cloudflare R2) ---
+    # R2 is S3-API-compatible (see app/core/s3.py, which talks to it via
+    # boto3's S3 client pointed at R2's endpoint) — these are R2's own
+    # credentials from the Cloudflare dashboard, NOT AWS IAM credentials.
+    # Deliberately no defaults for the credential/bucket fields — left unset
+    # until a real bucket exists rather than silently pointing at nothing.
+    # Only validated (in app/core/s3.py) at the point an upload endpoint is
+    # actually called, so a deployment that doesn't use uploads yet can still
+    # start up without them.
+    r2_account_id: str = ""
+    r2_access_key_id: str = ""
+    r2_secret_access_key: str = ""
+    r2_bucket_name: str = ""
 
 
     @field_validator("secret_key")

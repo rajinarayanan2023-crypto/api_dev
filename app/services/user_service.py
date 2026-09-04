@@ -8,7 +8,6 @@ from app.models.user import User
 from app.repositories.refresh_token_repository import RefreshTokenRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.user import PasswordChange, UserCreate, UserUpdate
-from app.services.audit import attach_actor_names
 
 
 class UserService:
@@ -28,23 +27,17 @@ class UserService:
             role=data.role.value,
             phone=data.phone,
             password_hash=hash_password(data.password),
-            created_by=actor.id,
-            updated_by=actor.id,
         )
         created = await self.users.create(user)
-        await attach_actor_names(self.session, [created])
         return created
 
     async def list_users(self, offset: int = 0, limit: int = 100) -> list[User]:
-        users = await self.users.list(offset=offset, limit=limit)
-        await attach_actor_names(self.session, users)
-        return users
+        return await self.users.list(offset=offset, limit=limit)
 
     async def get_user(self, user_id: uuid.UUID) -> User:
         user = await self.users.get(user_id)
         if user is None:
             raise NotFoundError("User not found.")
-        await attach_actor_names(self.session, [user])
         return user
 
     async def update_user(self, user_id: uuid.UUID, data: UserUpdate, actor: User) -> User:
@@ -54,18 +47,14 @@ class UserService:
             if field == "role":
                 value = value.value if hasattr(value, "value") else value
             setattr(user, field, value)
-        if updates:
-            user.updated_by = actor.id
         await self.session.flush()
         await self.session.refresh(user)
-        await attach_actor_names(self.session, [user])
         return user
 
     async def change_password(self, user: User, data: PasswordChange) -> None:
         if not verify_password(data.current_password, user.password_hash):
             raise UnauthorizedError("Current password is incorrect.")
         user.password_hash = hash_password(data.new_password)
-        user.updated_by = user.id
         await self.session.flush()
         # Changing the password invalidates every existing session so a
         # leaked/expired session can't keep using the old credential window.
@@ -74,6 +63,5 @@ class UserService:
     async def deactivate_user(self, user_id: uuid.UUID, actor: User) -> None:
         user = await self.get_user(user_id)
         user.active = False
-        user.updated_by = actor.id
         await self.session.flush()
         await self.refresh_tokens.revoke_all_for_user(user.id)

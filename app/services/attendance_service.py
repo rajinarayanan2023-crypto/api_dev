@@ -12,6 +12,12 @@ from app.schemas.attendance import AttendanceCreate, AttendanceUpdate
 from app.services.audit import attach_actor_names
 
 
+def _month_bounds(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return start, end - timedelta(days=1)
+
+
 class AttendanceService:
     def __init__(self, session: AsyncSession):
         self.session = session
@@ -62,9 +68,13 @@ class AttendanceService:
 
     async def list_for_month(self, employee_id: uuid.UUID, year: int, month: int) -> list[AttendanceRecord]:
         await self._ensure_employee_exists(employee_id)
-        start = date(year, month, 1)
-        end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
-        end = end - timedelta(days=1)
+        start, end = _month_bounds(year, month)
         records = await self.attendance.list_for_employee_in_range(employee_id, start, end)
+        await attach_actor_names(self.session, records)
+        return records
+
+    async def list_all_for_month(self, year: int, month: int) -> list[AttendanceRecord]:
+        start, end = _month_bounds(year, month)
+        records = await self.attendance.list_for_range(start, end)
         await attach_actor_names(self.session, records)
         return records

@@ -79,3 +79,17 @@ async def add_ledger_entry(
     service = CreditCustomerService(session)
     customer = await service.add_ledger_entry(customer_id, body, current_user)
     return CreditCustomerOut.model_validate(customer)
+
+
+@router.delete(
+    "/{customer_id}/ledger/{entry_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_manager_or_admin)],
+)
+async def delete_ledger_entry(
+    customer_id: uuid.UUID,
+    entry_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db_session),
+) -> None:
+    service = CreditCustomerService(session)
+    await service.delete_ledger_entry(customer_id, entry_id)

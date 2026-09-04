@@ -1,9 +1,9 @@
 import uuid
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import ORMModel
 
@@ -40,8 +40,26 @@ class PaymentLineIn(BaseModel):
     customer_id: uuid.UUID | None = None
     employee_id: uuid.UUID | None = None
     note: str | None = None
+    # Till-count breakdown for a cash line, e.g. {"500": 4, "200": 1, "coins": 30}
+    # — opaque passthrough, only ever read back out, never computed on.
+    denominations: dict[str, Any] | None = None
+
+    # The UI writes 'employeeCredit' (camelCase); the DB/service layer speaks
+    # 'employee_credit'. Normalized here, at the boundary, rather than
+    # trusting every caller to send the snake_case form.
+    @field_validator("type", mode="before")
+    @classmethod
+    def _normalize_type(cls, v: Any) -> Any:
+        if v == "employeeCredit":
+            return "employee_credit"
+        return v
 
 
+# file_url holds the R2 object KEY, not a resolvable URL — a presigned GET
+# URL expires, so one is generated fresh on demand by GET
+# /uploads/{key}/download-url instead of ever being stored. Field kept named
+# file_url (not renamed to e.g. file_key) to avoid touching every caller
+# that already reads/writes it — only what's stored in it changed.
 class FuelEntryBillIn(BaseModel):
     file_name: str
     file_url: str
@@ -99,6 +117,7 @@ class PaymentLineOut(BaseModel):
     customer_id: uuid.UUID | None = None
     employee_id: uuid.UUID | None = None
     note: str | None = None
+    denominations: dict[str, Any] | None = None
 
 
 class FuelEntryBillOut(BaseModel):

@@ -50,6 +50,17 @@ async def delete_attendance(
     return Message(detail="Attendance record deleted.")
 
 
+@router.get("", response_model=list[AttendanceOut])
+async def list_attendance_for_all(
+    year: int = Query(..., ge=2000, le=2100),
+    month: int = Query(..., ge=1, le=12),
+    session: AsyncSession = Depends(get_db_session),
+) -> list[AttendanceOut]:
+    service = AttendanceService(session)
+    records = await service.list_all_for_month(year, month)
+    return [AttendanceOut.model_validate(r) for r in records]
+
+
 @router.get("/{employee_id}", response_model=list[AttendanceOut])
 async def list_attendance_for_month(
     employee_id: uuid.UUID,

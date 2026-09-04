@@ -4,7 +4,7 @@ from datetime import datetime
 from sqlalchemy import Boolean, CheckConstraint, DateTime, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.models.base import AuditMixin, Base, UUIDPkMixin
+from app.models.base import Base, UUIDPkMixin
 
 
 class UserRole(str, enum.Enum):
@@ -13,10 +13,10 @@ class UserRole(str, enum.Enum):
     STAFF = "staff"
 
 
-class User(Base, UUIDPkMixin, AuditMixin):
+class User(Base, UUIDPkMixin):
     """No screen creates these today — seeded directly via scripts/create_admin.py.
-    created_by is null for that bootstrap admin (no acting user yet) and set
-    for every user created afterwards via POST /users.
+    No audit trail on this table (no created_at/updated_at/created_by/updated_by)
+    — removed by product decision; every other table still carries AuditMixin.
     """
 
     __tablename__ = "Users"
@@ -27,7 +27,7 @@ class User(Base, UUIDPkMixin, AuditMixin):
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     role: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'staff'"))
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("true"))
-    # Where login OTPs are sent (see LoginOtp/AuthService) — nullable since
+    # Where login OTPs are sent (see app/core/otp_store.py) — nullable since
     # existing accounts predate the OTP feature and have none on file yet.
     phone: Mapped[str | None] = mapped_column(Text)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -24,7 +24,6 @@ DUMMY_PASSWORD_HASH = pwd_context.hash(secrets.token_urlsafe(32))
 class TokenType(str, Enum):
     ACCESS = "access"
     REFRESH = "refresh"
-    OTP_PENDING = "otp_pending"
 
 
 def hash_password(password: str) -> str:
@@ -68,20 +67,6 @@ def create_refresh_token(subject: str) -> tuple[str, str, datetime]:
     token, jti = _create_token(subject=subject, token_type=TokenType.REFRESH, expires_delta=expires_delta)
     expires_at = datetime.now(timezone.utc) + expires_delta
     return token, jti, expires_at
-
-
-def create_otp_pending_token(subject: str) -> str:
-    """Short-lived token binding a pending login to the user who passed the
-    password check — presented back to /auth/verify-otp along with the code.
-    It is NOT an access token: it carries no role claim and every dependency
-    that accepts real sessions only recognizes TokenType.ACCESS/REFRESH.
-    """
-    token, _ = _create_token(
-        subject=subject,
-        token_type=TokenType.OTP_PENDING,
-        expires_delta=timedelta(minutes=settings.otp_expire_minutes),
-    )
-    return token
 
 
 def decode_token(token: str) -> dict:

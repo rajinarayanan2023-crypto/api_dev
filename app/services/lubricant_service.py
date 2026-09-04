@@ -3,7 +3,7 @@ from datetime import date
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError
 from app.models.lubricant import LubricantPriceHistory, LubricantProduct, LubricantPurchaseHistory
 from app.models.user import User
 from app.repositories.lubricant_repository import LubricantRepository
@@ -17,6 +17,8 @@ class LubricantService:
         self.products = LubricantRepository(session)
 
     async def create_product(self, data: LubricantCreate, actor: User) -> LubricantProduct:
+        if await self.products.get_by_name_ci(data.name) is not None:
+            raise ConflictError("A product with this name already exists.")
         payload = data.model_dump(exclude={"opening_rate", "opening_stock"})
         product = LubricantProduct(**payload, stock=data.opening_stock, created_by=actor.id, updated_by=actor.id)
         today = date.today()
@@ -52,6 +54,10 @@ class LubricantService:
     async def update_product(self, product_id: uuid.UUID, data: LubricantUpdate, actor: User) -> LubricantProduct:
         product = await self.get_product(product_id)
         updates = data.model_dump(exclude_unset=True)
+        if "name" in updates:
+            existing = await self.products.get_by_name_ci(updates["name"])
+            if existing is not None and existing.id != product_id:
+                raise ConflictError("A product with this name already exists.")
         for field, value in updates.items():
             setattr(product, field, value)
         if updates:
@@ -81,6 +87,12 @@ class LubricantService:
                 product_id=product.id, effective_from=data.effective_from, rate=data.rate
             )
             await self.products.add_price_revision(revision)
+            # The new row went in through a separate object, not through
+            # product.price_history itself, so that already-loaded collection
+            # is now stale in the session's identity map — expire it so
+            # get_product() below actually re-reads it instead of returning
+            # the cached (pre-insert) collection.
+            self.session.expire(product, ["price_history"])
         product.updated_by = actor.id
         await self.session.flush()
         return await self.get_product(product_id)
@@ -93,6 +105,8 @@ class LubricantService:
         await self.products.add_purchase(purchase)
         product.stock = (product.stock or 0) + data.qty
         product.updated_by = actor.id
+        # Same staleness issue as add_price_revision above, for purchase_history.
+        self.session.expire(product, ["purchase_history"])
         await self.session.flush()
         return await self.get_product(product_id)
 

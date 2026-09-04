@@ -1,5 +1,5 @@
 import uuid
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AppError, ConflictError, NotFoundError
+from app.core.s3 import delete_object
 from app.models.attendance import AttendanceRecord
 from app.models.credit import CreditCustomer, CreditLedgerEntry
 from app.models.employee import Employee, EmployeeCredit
@@ -108,13 +109,30 @@ class FuelEntryService:
                 customer_id=p.customer_id if p.customer_id in valid_customer_ids else None,
                 employee_id=p.employee_id if p.employee_id in valid_employee_ids else None,
                 note=p.note,
+                denominations=p.denominations,
             )
             for p in data.payments
         ]
 
-    def _build_bills(self, data: FuelEntryWrite) -> list[FuelEntryBill]:
+    # Diffs the incoming payload against whatever bill rows are already on
+    # the entry (by file_url, which holds the R2 key — never trust two
+    # different keys to be "the same bill") instead of unconditionally
+    # building a fresh FuelEntryBill for every one of them. A bill whose key
+    # already has a row is reused AS THE SAME PYTHON OBJECT: since
+    # FuelEntry.bills is cascade="all, delete-orphan", SQLAlchemy diffs a
+    # collection replacement by object identity, not by column equality —
+    # reusing the existing instance is what makes an untouched bill a true
+    # no-op on flush (no DELETE, no INSERT, no UPDATE), where rebuilding a
+    # new instance every time would silently orphan-delete and reinsert it
+    # on every single save regardless of whether anything actually changed.
+    # Removed keys (a row that existed before but is missing from this
+    # payload) get their R2 object deleted by the caller once it knows the
+    # full before/after diff — see _apply_write.
+    def _build_bills(self, data: FuelEntryWrite, existing_bills: list[FuelEntryBill] = ()) -> list[FuelEntryBill]:
+        existing_by_key = {b.file_url: b for b in existing_bills}
         return [
-            FuelEntryBill(file_name=b.file_name, file_url=b.file_url, uploaded_date=b.uploaded_date)
+            existing_by_key.get(b.file_url)
+            or FuelEntryBill(file_name=b.file_name, file_url=b.file_url, uploaded_date=b.uploaded_date)
             for b in data.bills
         ]
 
@@ -141,7 +159,20 @@ class FuelEntryService:
         entry.readings = self._build_readings(data)
         entry.oil_rows = self._build_oil_rows(data)
         entry.payment_lines = await self._build_payments(data)
-        entry.bills = self._build_bills(data)
+
+        # Bills are the one child collection that must NOT follow the
+        # unconditional full-replace pattern above: a bill photo already
+        # sitting in R2 has no reason to be deleted-and-reinserted in
+        # Postgres (and, if it did, would call for deleting-and-reuploading
+        # it in R2 too) just because some unrelated field on the same entry
+        # changed. Diff by key first, then only the genuinely-removed keys
+        # get their R2 object deleted — every unchanged bill costs zero R2
+        # calls and zero DB writes.
+        existing_bills = list(entry.bills)
+        removed_keys = {b.file_url for b in existing_bills} - {b.file_url for b in data.bills}
+        entry.bills = self._build_bills(data, existing_bills)
+        for key in removed_keys:
+            delete_object(key)
 
     # ---------- serialization ----------
 
@@ -177,11 +208,14 @@ class FuelEntryService:
                     }
             return out
 
-        petrol = nozzles_out("petrol") or {
-            "nozzle1": {"opening": Decimal("0"), "closing": Decimal("0"), "testing": Decimal("0"), "rate": Decimal("0"), "liters": Decimal("0"), "amount": Decimal("0")},
-            "nozzle2": {"opening": Decimal("0"), "closing": Decimal("0"), "testing": Decimal("0"), "rate": Decimal("0"), "liters": Decimal("0"), "amount": Decimal("0")},
-        }
-        diesel = nozzles_out("diesel") or petrol
+        def zero_nozzles():
+            zero = {"opening": Decimal("0"), "closing": Decimal("0"), "testing": Decimal("0"), "rate": Decimal("0"), "liters": Decimal("0"), "amount": Decimal("0")}
+            return {"nozzle1": dict(zero), "nozzle2": dict(zero)}
+
+        petrol = nozzles_out("petrol") or zero_nozzles()
+        # Was `or petrol` — an entry with no diesel rows echoed petrol's
+        # readings back as diesel's. Each fuel now falls back to its own zeros.
+        diesel = nozzles_out("diesel") or zero_nozzles()
         oil = nozzles_out("oil")
 
         fuel_amount_total = Decimal("0")
@@ -220,6 +254,7 @@ class FuelEntryService:
                 "customer_id": p.customer_id,
                 "employee_id": p.employee_id,
                 "note": p.note,
+                "denominations": p.denominations,
             }
             for p in entry.payment_lines
         ]
@@ -380,8 +415,9 @@ class FuelEntryService:
     # ---------- public API ----------
 
     async def create(self, data: FuelEntryWrite, actor: User) -> dict:
-        if data.status == "final" and not data.bills:
-            raise AppError("At least one bill is required to finalize a shift entry.")
+        # Bill-upload requirement temporarily disabled — see update() below.
+        # if data.status == "final" and not data.bills:
+        #     raise AppError("At least one bill is required to finalize a shift entry.")
         entry = FuelEntry(created_by=actor.id, updated_by=actor.id)
         await self._apply_write(entry, data)
         self.session.add(entry)
@@ -398,9 +434,16 @@ class FuelEntryService:
         return await self._serialize(full)
 
     async def update(self, entry_id: uuid.UUID, data: FuelEntryWrite, actor: User) -> dict:
-        if data.status == "final" and not data.bills:
-            raise AppError("At least one bill is required to finalize a shift entry.")
-        existing = await self.entries.get_with_details(entry_id)
+        # Bill-upload requirement temporarily disabled — a fuel entry can be
+        # finalized without a bill for now. Restore these two checks (here
+        # and in create() above) to bring the requirement back.
+        # if data.status == "final" and not data.bills:
+        #     raise AppError("At least one bill is required to finalize a shift entry.")
+        # Row-locked for the rest of this transaction — see
+        # get_with_details_for_update's docstring for why: this is what
+        # actually closes the concurrent-update race, the frontend-side fix
+        # (cancelling a pending autosave before a manual save) only narrows it.
+        existing = await self.entries.get_with_details_for_update(entry_id)
         if existing is None:
             raise NotFoundError("Fuel entry not found.")
 
@@ -436,7 +479,10 @@ class FuelEntryService:
             await self._apply_oil_stock(existing, 1)
         await self._remove_credit_ledger_by_source(entry_id)
         await self._remove_employee_credit_by_source(entry_id)
+        bill_keys = [b.file_url for b in existing.bills]
         await self.entries.delete(existing)
+        for key in bill_keys:
+            delete_object(key)
 
     async def get(self, entry_id: uuid.UUID) -> dict:
         entry = await self.entries.get_with_details(entry_id)
@@ -445,7 +491,16 @@ class FuelEntryService:
         await attach_actor_names(self.session, [entry])
         return await self._serialize(entry)
 
-    async def list_all(self, offset: int = 0, limit: int = 1000) -> list[dict]:
-        entries = await self.entries.list_with_details(offset=offset, limit=limit)
+    async def list_all(
+        self,
+        offset: int = 0,
+        limit: int = 1000,
+        pump_key: str | None = None,
+        entry_date: date | None = None,
+        before: date | None = None,
+    ) -> list[dict]:
+        entries = await self.entries.list_with_details(
+            offset=offset, limit=limit, pump_key=pump_key, entry_date=entry_date, before=before
+        )
         await attach_actor_names(self.session, entries)
         return [await self._serialize(e) for e in entries]

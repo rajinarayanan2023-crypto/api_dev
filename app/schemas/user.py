@@ -26,7 +26,7 @@ class UserBase(BaseModel):
     email: EmailStr
     name: str = Field(min_length=1, max_length=255)
     role: UserRole = UserRole.STAFF
-    # Where login OTPs are sent (see LoginOtp) — optional since not every
+    # Where login OTPs are sent (see app/core/otp_store.py) — optional since not every
     # account has one on file yet.
     phone: str | None = Field(default=None, max_length=20)
 
@@ -65,9 +65,3 @@ class UserOut(ORMModel):
     active: bool
     phone: str | None = None
     last_login_at: datetime | None
-    created_at: datetime
-    updated_at: datetime
-    created_by: uuid.UUID | None = None
-    created_by_name: str | None = None
-    updated_by: uuid.UUID | None = None
-    updated_by_name: str | None = None

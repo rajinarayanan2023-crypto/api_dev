@@ -52,6 +52,9 @@ class CreditLedgerEntry(Base, UUIDPkMixin):
             name="ck_credit_ledger_entries_fuel_type",
         ),
         Index("idx_credit_ledger_entries_customer", "customer_id", "date"),
+        # FK, filtered directly in FuelEntryService._remove_credit_ledger_by_source
+        # on every edit/delete of an already-final fuel entry (migration d4a7e2c9f1b3).
+        Index("idx_credit_ledger_entries_source_fuel_entry", "source_fuel_entry_id"),
     )
 
     customer_id: Mapped[uuid.UUID] = mapped_column(

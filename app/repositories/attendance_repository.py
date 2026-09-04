@@ -31,3 +31,14 @@ class AttendanceRepository(BaseRepository[AttendanceRecord]):
             .order_by(AttendanceRecord.date)
         )
         return list(result.scalars().all())
+
+    # Every employee's attendance for one month in a single query — the
+    # Attendance page's Mark/History views need the whole roster at once,
+    # not one employee at a time.
+    async def list_for_range(self, start: date, end: date) -> list[AttendanceRecord]:
+        result = await self.session.execute(
+            select(AttendanceRecord)
+            .where(AttendanceRecord.date >= start, AttendanceRecord.date <= end)
+            .order_by(AttendanceRecord.date)
+        )
+        return list(result.scalars().all())

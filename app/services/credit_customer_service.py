@@ -3,7 +3,8 @@ from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import ConflictError, NotFoundError
+from app.core.s3 import delete_object
 from app.models.credit import CreditCustomer, CreditCustomerBill, CreditLedgerEntry
 from app.models.user import User
 from app.repositories.credit_customer_repository import CreditCustomerRepository
@@ -28,9 +29,21 @@ class CreditCustomerService:
         self.session = session
         self.customers = CreditCustomerRepository(session)
 
-    def _bills_from(self, bills) -> list[CreditCustomerBill]:
+    # Diffs by key (file_url, which holds the R2 key) against whatever's
+    # already there, instead of unconditionally building a fresh
+    # CreditCustomerBill for every one — mirrors FuelEntryService._build_bills
+    # exactly, for the same reason: CreditCustomer.bills is cascade="all,
+    # delete-orphan", so SQLAlchemy diffs a collection replacement by object
+    # identity, not column equality. Reusing the existing row for an
+    # unchanged key is what makes it a true no-op on flush; a freshly-built
+    # instance would look like a different row and get orphan-deleted +
+    # reinserted even though nothing changed. On create there's nothing to
+    # match against, so every bill is naturally new.
+    def _bills_from(self, bills, existing_bills: list[CreditCustomerBill] = ()) -> list[CreditCustomerBill]:
+        existing_by_key = {b.file_url: b for b in existing_bills}
         return [
-            CreditCustomerBill(file_name=b.file_name, file_url=b.file_url, uploaded_date=b.uploaded_date)
+            existing_by_key.get(b.file_url)
+            or CreditCustomerBill(file_name=b.file_name, file_url=b.file_url, uploaded_date=b.uploaded_date)
             for b in bills
         ]
 
@@ -68,18 +81,31 @@ class CreditCustomerService:
         updates = data.model_dump(exclude_unset=True, exclude={"bills"})
         for field, value in updates.items():
             setattr(customer, field, value)
+        removed_keys: set[str] = set()
         if data.bills is not None:
-            customer.bills = self._bills_from(data.bills)
+            existing_bills = list(customer.bills)
+            removed_keys = {b.file_url for b in existing_bills} - {b.file_url for b in data.bills}
+            customer.bills = self._bills_from(data.bills, existing_bills)
         if updates or data.bills is not None:
             customer.updated_by = actor.id
         await self.session.flush()
+        for key in removed_keys:
+            delete_object(key)
         return await self.get(customer_id)
 
     async def delete(self, customer_id: uuid.UUID) -> None:
         customer = await self.customers.get_with_details(customer_id)
         if customer is None:
             raise NotFoundError("Credit customer not found.")
+        # Every bill/document tied to this customer — its own Bills &
+        # Documents plus any per-ledger-entry attachment — is about to
+        # cascade-delete in Postgres along with it; clean up the matching R2
+        # objects too so deleting a customer doesn't leave them orphaned.
+        bill_keys = [b.file_url for b in customer.bills]
+        bill_keys += [e.bill_file_url for e in customer.ledger_entries if e.bill_file_url]
         await self.customers.delete(customer)
+        for key in bill_keys:
+            delete_object(key)
 
     async def add_ledger_entry(self, customer_id: uuid.UUID, data: CreditLedgerEntryCreate, actor: User) -> CreditCustomer:
         customer = await self.customers.get_with_details(customer_id)
@@ -108,3 +134,18 @@ class CreditCustomerService:
         customer.updated_by = actor.id
         await self.session.flush()
         return await self.get(customer_id)
+
+    # Mirrors the UI's own rule (see CreditBills.jsx) — an entry created from
+    # a real Fuel Entry payment line stays tied to it; only manually-added
+    # rows (here, or via the Audit modal) can be removed directly.
+    async def delete_ledger_entry(self, customer_id: uuid.UUID, entry_id: uuid.UUID) -> None:
+        entry = await self.customers.get_ledger_entry(entry_id)
+        if entry is None or entry.customer_id != customer_id:
+            raise NotFoundError("Ledger entry not found.")
+        if entry.source_fuel_entry_id is not None:
+            raise ConflictError("This entry was created from a Fuel Entry and can't be removed directly.")
+        bill_key = entry.bill_file_url
+        await self.session.delete(entry)
+        await self.session.flush()
+        if bill_key:
+            delete_object(bill_key)

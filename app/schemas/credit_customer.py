@@ -11,6 +11,12 @@ LedgerType = Literal["credit", "payment"]
 FuelType = Literal["petrol", "diesel", "oil"]
 
 
+# file_url (here and on CreditLedgerEntryCreate/Out's bill_file_url) holds
+# the R2 object KEY, not a resolvable URL — a presigned GET URL expires, so
+# one is generated fresh on demand by GET /uploads/{key}/download-url
+# instead of ever being stored. Fields kept named file_url/bill_file_url
+# (not renamed) to avoid touching every caller that already reads/writes
+# them — only what's stored in them changed.
 class CreditCustomerBillIn(BaseModel):
     file_name: str
     file_url: str

@@ -26,6 +26,10 @@ class AttendanceRecord(Base, UUIDPkMixin, AuditMixin):
             name="ck_attendance_records_status",
         ),
         Index("idx_attendance_employee_date", "employee_id", "date"),
+        # Serves list_for_range's whole-roster month view (no employee_id
+        # filter) — the composite above leads with employee_id so it can't
+        # help there (see migration d4a7e2c9f1b3).
+        Index("idx_attendance_date", "date"),
     )
 
     employee_id: Mapped[uuid.UUID] = mapped_column(

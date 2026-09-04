@@ -1,54 +1,35 @@
-import uuid
-from pathlib import Path
-
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends
 
 from app.api.deps import get_current_active_user
-from app.core.config import get_settings
-from app.core.exceptions import PayloadTooLargeError, UnsupportedMediaTypeError
-from app.schemas.upload import UploadOut
+from app.core.exceptions import UnsupportedMediaTypeError
+from app.core.s3 import build_key, delete_object, get_download_presigned_url, get_upload_presigned_url
+from app.schemas.upload import ALLOWED_CONTENT_TYPES, DownloadUrlOut, PresignedUploadOut, PresignedUploadRequest
 
-settings = get_settings()
 router = APIRouter(prefix="/uploads", tags=["uploads"], dependencies=[Depends(get_current_active_user)])
 
-# Bills are photos of paper receipts/invoices, occasionally a scanned PDF —
-# nothing else is a legitimate use of this endpoint.
-_ALLOWED_CONTENT_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-    "image/heic",
-    "image/heif",
-    "application/pdf",
-}
-_EXTENSION_BY_CONTENT_TYPE = {
-    "image/jpeg": ".jpg",
-    "image/png": ".png",
-    "image/webp": ".webp",
-    "image/heic": ".heic",
-    "image/heif": ".heif",
-    "application/pdf": ".pdf",
-}
+
+# Direct-to-R2 flow: the browser PUTs the file bytes straight to the
+# presigned URL below, bypassing this backend entirely for the file itself —
+# this endpoint only ever handles the small JSON request/response around it.
+@router.post("/presigned-upload", response_model=PresignedUploadOut)
+async def create_presigned_upload(body: PresignedUploadRequest) -> PresignedUploadOut:
+    content_type = body.content_type.lower()
+    if content_type not in ALLOWED_CONTENT_TYPES:
+        raise UnsupportedMediaTypeError("Only JPEG/PNG/WEBP/HEIC images and PDFs are accepted for bill uploads.")
+    key = build_key(body.category, body.filename)
+    upload_url = get_upload_presigned_url(key, content_type)
+    return PresignedUploadOut(upload_url=upload_url, key=key)
 
 
-@router.post("", response_model=UploadOut)
-async def upload_file(file: UploadFile = File(...)) -> UploadOut:
-    content_type = (file.content_type or "").lower()
-    if content_type not in _ALLOWED_CONTENT_TYPES:
-        raise UnsupportedMediaTypeError(
-            "Only JPEG/PNG/WEBP/HEIC images and PDFs are accepted for bill uploads."
-        )
+# Generated fresh on demand only — never in bulk when a list of bills is
+# fetched (see FuelEntryService._serialize / CreditCustomerOut) — a
+# presigned GET URL is only worth generating for a bill someone is actually
+# about to open.
+@router.get("/{key:path}/download-url", response_model=DownloadUrlOut)
+async def create_download_url(key: str) -> DownloadUrlOut:
+    return DownloadUrlOut(download_url=get_download_presigned_url(key))
 
-    max_bytes = settings.upload_max_size_mb * 1024 * 1024
-    content = await file.read()
-    if len(content) > max_bytes:
-        raise PayloadTooLargeError(f"File exceeds the {settings.upload_max_size_mb}MB limit.")
 
-    upload_dir = Path(settings.upload_dir)
-    upload_dir.mkdir(parents=True, exist_ok=True)
-
-    extension = _EXTENSION_BY_CONTENT_TYPE[content_type]
-    stored_name = f"{uuid.uuid4().hex}{extension}"
-    (upload_dir / stored_name).write_bytes(content)
-
-    return UploadOut(file_name=file.filename or stored_name, file_url=f"/uploads/{stored_name}")
+@router.delete("/{key:path}", status_code=204)
+async def delete_upload(key: str) -> None:
+    delete_object(key)

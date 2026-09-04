@@ -8,14 +8,13 @@ from sqlalchemy import (
     Date,
     ForeignKey,
     Index,
-    Integer,
     Numeric,
     SmallInteger,
     Text,
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import AuditMixin, Base, UUIDPkMixin
@@ -33,6 +32,12 @@ class FuelEntry(Base, UUIDPkMixin, AuditMixin):
         Index("idx_fuel_entries_date", "date"),
         Index("idx_fuel_entries_pump_date", "pump_key", "date"),
         Index("idx_fuel_entries_employee", "employee_id"),
+        # Matches count_final_for_employee_on_date's exact filter (the
+        # attendance auto-mark cascade, run on every finalized fuel entry) —
+        # migration d4a7e2c9f1b3. idx_fuel_entries_employee above is now
+        # largely superseded by this via the leftmost-prefix rule but is
+        # left in place; this migration only adds what was missing.
+        Index("idx_fuel_entries_employee_date", "employee_id", "date"),
     )
 
     date: Mapped[date] = mapped_column(Date, nullable=False)
@@ -100,7 +105,10 @@ class FuelEntryOilRow(Base, UUIDPkMixin):
     product_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("Lubricant_Products.id", ondelete="SET NULL")
     )
-    stock_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Numeric, not Integer — a count can be fractional (e.g. a partial cane
+    # tin), and the UI clamps against a stock figure already rounded to 3
+    # decimals (migration e2b7c4f9a1d6).
+    stock_count: Mapped[Decimal] = mapped_column(Numeric(10, 3), nullable=False, server_default=text("0"))
     stock_rate: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default=text("0"))
 
     fuel_entry: Mapped["FuelEntry"] = relationship(back_populates="oil_rows")
@@ -113,7 +121,9 @@ class PaymentLine(Base, UUIDPkMixin):
 
     __tablename__ = "Payment_Lines"
     __table_args__ = (
-        CheckConstraint("type IN ('cash', 'credit', 'employee_credit')", name="ck_payment_lines_type"),
+        # 'expense' allowed since migration 8f3c1a9d5e2b — this declaration
+        # had drifted out of sync with the live constraint until now.
+        CheckConstraint("type IN ('cash', 'credit', 'employee_credit', 'expense')", name="ck_payment_lines_type"),
         Index("idx_payment_lines_entry", "fuel_entry_id"),
         Index("idx_payment_lines_customer", "customer_id"),
         Index("idx_payment_lines_employee", "employee_id"),
@@ -132,6 +142,10 @@ class PaymentLine(Base, UUIDPkMixin):
         UUID(as_uuid=True), ForeignKey("Employees.id", ondelete="SET NULL")
     )
     note: Mapped[str | None] = mapped_column(Text)
+    # Till-count breakdown for a cash line — {"500": n, "200": n, ..., "coins": n}
+    # — opaque to the backend, kept only so the manager's actual note count
+    # survives a save; `amount` (derived client-side) stays authoritative.
+    denominations: Mapped[dict | None] = mapped_column(JSONB)
 
     fuel_entry: Mapped["FuelEntry"] = relationship(back_populates="payment_lines")
 

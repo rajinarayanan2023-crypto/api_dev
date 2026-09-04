@@ -1,8 +1,8 @@
 import uuid
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Numeric, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, Date, ForeignKey, Index, Numeric, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -44,11 +44,24 @@ class EmployeeSalaryHistory(Base, UUIDPkMixin):
     employee: Mapped["Employee"] = relationship(back_populates="salary_history")
 
 
-class EmployeeCredit(Base, UUIDPkMixin):
-    """Advance taken by an employee at the pump, owed back against future pay."""
+class EmployeeCredit(Base, UUIDPkMixin, AuditMixin):
+    """Advance taken by an employee at the pump, owed back against future pay.
+
+    Originally a child/detail table left without its own audit trail (see
+    migration 70a270f302c0) since it only ever existed as a side effect of
+    Fuel Entry. Now also directly created/edited/deleted from its own
+    standalone screen, so — unlike other child tables — it gets full
+    created_at/updated_at/created_by/updated_by via AuditMixin (migration
+    f3e7a9c1b5d8).
+    """
 
     __tablename__ = "Employee_Credits"
-    __table_args__ = (Index("idx_employee_credits_employee", "employee_id", "date"),)
+    __table_args__ = (
+        Index("idx_employee_credits_employee", "employee_id", "date"),
+        # FK, filtered directly in FuelEntryService._remove_employee_credit_by_source
+        # on every edit/delete of an already-final fuel entry (migration d4a7e2c9f1b3).
+        Index("idx_employee_credits_source_fuel_entry", "source_fuel_entry_id"),
+    )
 
     employee_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("Employees.id", ondelete="CASCADE"), nullable=False
@@ -59,6 +72,5 @@ class EmployeeCredit(Base, UUIDPkMixin):
     source_fuel_entry_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("Fuel_Entries.id", ondelete="SET NULL")
     )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     employee: Mapped["Employee"] = relationship(back_populates="credits")

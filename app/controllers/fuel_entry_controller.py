@@ -1,4 +1,5 @@
 import uuid
+from datetime import date
 
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,12 +14,15 @@ router = APIRouter(prefix="/fuel-entries", tags=["fuel-entries"], dependencies=[
 
 @router.get("", response_model=list[FuelEntryOut])
 async def list_fuel_entries(
+    pump_key: str | None = Query(default=None),
+    entry_date: date | None = Query(default=None, alias="date"),
+    before: date | None = Query(default=None, alias="before", description="Entries strictly before this date — e.g. the most recent prior entry for a pump"),
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=1000, ge=1, le=2000),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[FuelEntryOut]:
     service = FuelEntryService(session)
-    entries = await service.list_all(offset=offset, limit=limit)
+    entries = await service.list_all(offset=offset, limit=limit, pump_key=pump_key, entry_date=entry_date, before=before)
     return [FuelEntryOut(**e) for e in entries]
 
 
