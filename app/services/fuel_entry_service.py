@@ -382,14 +382,22 @@ class FuelEntryService:
         product.stock = (product.stock or Decimal("0")) + delta
         await self.session.flush()
 
+    # 2T oil (machine) is a nozzle-metered fuel sale, tracked in litres via
+    # `entry.readings` exactly like petrol/diesel — it settles into the
+    # day's sale/litres totals through the same readings math those use,
+    # and never touches Lubricant_Products.stock (there's no catalog
+    # product it corresponds to). Pocket oil and Servo/cane oil are the
+    # opposite: real catalog products (created in the Lubricants section),
+    # sold by the piece — every row below decrements exactly the product it
+    # named by exactly the count actually sold, the same "purchase count"
+    # the Lubricants page itself reduces on a sale. The two were previously
+    # conflated (machine litres were also subtracted from whichever product
+    # happened to be the first pocket-oil row), which silently turned a
+    # whole-piece stock count into a fractional one — removed; only the
+    # per-row piece-count loop below still applies.
     async def _apply_oil_stock(self, entry: FuelEntry, sign: int) -> None:
         if entry.pump_key != "pump2":
             return
-        oil_readings = [r for r in entry.readings if r.fuel_type == "oil"]
-        liters = sum((_reading_liters(r.opening, r.closing, r.testing) for r in oil_readings), Decimal("0"))
-        pocket_rows = [r for r in entry.oil_rows if r.row_type == "pocket"]
-        if pocket_rows and pocket_rows[0].product_id and liters:
-            await self._adjust_stock(pocket_rows[0].product_id, sign * liters)
         for row in entry.oil_rows:
             if row.product_id and row.stock_count:
                 await self._adjust_stock(row.product_id, sign * row.stock_count)
