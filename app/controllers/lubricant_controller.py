@@ -6,7 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_active_user, get_db_session, require_manager_or_admin
 from app.models.user import User
 from app.schemas.common import Message
-from app.schemas.lubricant import LubricantCreate, LubricantOut, LubricantUpdate, PriceHistoryCreate, PurchaseCreate
+from app.schemas.lubricant import (
+    LubricantCreate,
+    LubricantOut,
+    LubricantUpdate,
+    PriceHistoryCreate,
+    PurchaseCreate,
+    PurchaseUpdate,
+    SoldHistoryEntryOut,
+)
 from app.services.lubricant_service import LubricantService
 
 router = APIRouter(
@@ -77,6 +85,40 @@ async def add_purchase(
     service = LubricantService(session)
     product = await service.add_purchase(product_id, body, current_user)
     return LubricantOut.model_validate(product)
+
+
+@router.patch("/{product_id}/purchases/{purchase_id}", response_model=LubricantOut)
+async def update_purchase(
+    product_id: uuid.UUID,
+    purchase_id: uuid.UUID,
+    body: PurchaseUpdate,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_manager_or_admin),
+) -> LubricantOut:
+    service = LubricantService(session)
+    product = await service.update_purchase(product_id, purchase_id, body, current_user)
+    return LubricantOut.model_validate(product)
+
+
+@router.delete("/{product_id}/purchases/{purchase_id}", response_model=LubricantOut)
+async def delete_purchase(
+    product_id: uuid.UUID,
+    purchase_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_manager_or_admin),
+) -> LubricantOut:
+    service = LubricantService(session)
+    product = await service.delete_purchase(product_id, purchase_id, current_user)
+    return LubricantOut.model_validate(product)
+
+
+@router.get("/{product_id}/sales-history", response_model=list[SoldHistoryEntryOut])
+async def get_sales_history(
+    product_id: uuid.UUID, session: AsyncSession = Depends(get_db_session)
+) -> list[SoldHistoryEntryOut]:
+    service = LubricantService(session)
+    rows = await service.get_sales_history(product_id)
+    return [SoldHistoryEntryOut.model_validate(r) for r in rows]
 
 
 @router.delete(

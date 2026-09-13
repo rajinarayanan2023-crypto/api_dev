@@ -58,6 +58,17 @@ class FuelEntryRepository(BaseRepository[FuelEntry]):
         result = await self.session.execute(query)
         return list(result.scalars().all())
 
+    # Dashboard summary aggregation — every finalized entry in a calendar
+    # month, eager-loaded the same way as everywhere else (_WITH_DETAIL) so
+    # readings/oil_rows are available without N+1 lazy loads.
+    async def list_final_in_range(self, start: date, end: date) -> list[FuelEntry]:
+        result = await self.session.execute(
+            select(FuelEntry)
+            .options(*_WITH_DETAIL)
+            .where(FuelEntry.status == "final", FuelEntry.date >= start, FuelEntry.date <= end)
+        )
+        return list(result.scalars().all())
+
     async def count_final_for_employee_on_date(self, employee_id: uuid.UUID, day: date) -> int:
         result = await self.session.execute(
             select(func.count()).select_from(FuelEntry).where(

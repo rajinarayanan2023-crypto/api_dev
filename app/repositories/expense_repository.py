@@ -20,6 +20,13 @@ class ExpenseDayRepository(BaseRepository[ExpenseDay]):
         result = await self.session.execute(select(ExpenseDay).where(ExpenseDay.date == day))
         return result.scalar_one_or_none()
 
+    # Dashboard summary aggregation — every expense day in a calendar month.
+    async def list_with_items_in_range(self, start, end) -> list[ExpenseDay]:
+        result = await self.session.execute(
+            select(ExpenseDay).options(selectinload(ExpenseDay.items)).where(ExpenseDay.date >= start, ExpenseDay.date <= end)
+        )
+        return list(result.scalars().all())
+
     async def list_with_items(self, offset: int = 0, limit: int = 200) -> list[ExpenseDay]:
         result = await self.session.execute(
             select(ExpenseDay)

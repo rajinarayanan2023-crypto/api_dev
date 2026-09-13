@@ -7,7 +7,7 @@ from app.core.exceptions import ConflictError, NotFoundError
 from app.models.lubricant import LubricantPriceHistory, LubricantProduct, LubricantPurchaseHistory
 from app.models.user import User
 from app.repositories.lubricant_repository import LubricantRepository
-from app.schemas.lubricant import LubricantCreate, LubricantUpdate, PriceHistoryCreate, PurchaseCreate
+from app.schemas.lubricant import LubricantCreate, LubricantUpdate, PriceHistoryCreate, PurchaseCreate, PurchaseUpdate
 from app.services.audit import attach_actor_names
 
 
@@ -39,9 +39,17 @@ class LubricantService:
         # history eagerly loaded instead.
         return await self.get_product(created.id)
 
+    async def _attach_sales_summary(self, products: list[LubricantProduct]) -> None:
+        summary = await self.products.get_sales_summary([p.id for p in products])
+        for product in products:
+            last_date, total_qty = summary.get(product.id, (None, None))
+            product.last_sold_date = last_date
+            product.total_sold = total_qty or 0
+
     async def list_products(self, offset: int = 0, limit: int = 100) -> list[LubricantProduct]:
         products = await self.products.list_with_history(offset=offset, limit=limit)
         await attach_actor_names(self.session, products)
+        await self._attach_sales_summary(products)
         return products
 
     async def get_product(self, product_id: uuid.UUID) -> LubricantProduct:
@@ -49,6 +57,7 @@ class LubricantService:
         if product is None:
             raise NotFoundError("Lubricant product not found.")
         await attach_actor_names(self.session, [product])
+        await self._attach_sales_summary([product])
         return product
 
     async def update_product(self, product_id: uuid.UUID, data: LubricantUpdate, actor: User) -> LubricantProduct:
@@ -110,6 +119,84 @@ class LubricantService:
         await self.session.flush()
         return await self.get_product(product_id)
 
+    # Corrects a mis-entered purchase (wrong qty/cost/date) after the fact.
+    # There's no per-purchase consumption ledger — `product.stock` is one
+    # running total, incremented by every purchase and decremented by every
+    # sale as they happen (see FuelEntryService._adjust_stock) — so a qty
+    # correction can only ever apply as a DELTA against that running total,
+    # never as a fresh recompute (recomputing from purchases alone would
+    # forget every sale already deducted). If units from the ORIGINAL
+    # (wrong) quantity were already sold before this correction, reducing
+    # qty enough to outrun what's left in stock would drive it negative —
+    # blocked outright rather than silently corrupting the stock count.
+    async def update_purchase(
+        self, product_id: uuid.UUID, purchase_id: uuid.UUID, data: PurchaseUpdate, actor: User
+    ) -> LubricantProduct:
+        product = await self.get_product(product_id)
+        purchase = next((p for p in product.purchase_history if p.id == purchase_id), None)
+        if purchase is None:
+            raise NotFoundError("Purchase record not found.")
+        updates = data.model_dump(exclude_unset=True)
+        if "qty" in updates and updates["qty"] != purchase.qty:
+            delta = updates["qty"] - purchase.qty
+            resulting_stock = (product.stock or 0) + delta
+            if resulting_stock < 0:
+                raise ConflictError(
+                    f"Can't reduce this purchase to {updates['qty']} {product.unit} — that's "
+                    f"{abs(resulting_stock)} {product.unit} more than what's left in stock, since some "
+                    "of the original quantity has already been sold. Enter a larger quantity."
+                )
+            product.stock = resulting_stock
+        for field, value in updates.items():
+            setattr(purchase, field, value)
+        if updates:
+            product.updated_by = actor.id
+        await self.session.flush()
+        self.session.expire(product, ["purchase_history"])
+        return await self.get_product(product_id)
+
+    # Same stock-delta safety as update_purchase above, applied as a full
+    # removal (delta = -qty) instead of a partial correction.
+    async def delete_purchase(self, product_id: uuid.UUID, purchase_id: uuid.UUID, actor: User) -> LubricantProduct:
+        product = await self.get_product(product_id)
+        purchase = next((p for p in product.purchase_history if p.id == purchase_id), None)
+        if purchase is None:
+            raise NotFoundError("Purchase record not found.")
+        resulting_stock = (product.stock or 0) - purchase.qty
+        if resulting_stock < 0:
+            raise ConflictError(
+                f"Can't remove this purchase — {abs(resulting_stock)} {product.unit} more than "
+                "what's left in stock have already been sold since it was recorded. Removing it "
+                "would take stock negative."
+            )
+        product.stock = resulting_stock
+        await self.products.delete_purchase(purchase)
+        product.updated_by = actor.id
+        await self.session.flush()
+        self.session.expire(product, ["purchase_history"])
+        return await self.get_product(product_id)
+
+    async def get_sales_history(self, product_id: uuid.UUID) -> list[dict]:
+        await self.get_product(product_id)  # 404s if the product doesn't exist
+        rows = await self.products.get_sales_history(product_id)
+        return [
+            {
+                "fuel_entry_id": entry.id,
+                "date": entry.date,
+                "pump_key": entry.pump_key,
+                "shift_number": entry.shift_number,
+                "row_type": row.row_type,
+                "qty": row.stock_count,
+                "rate": row.stock_rate,
+                "amount": row.stock_count * row.stock_rate,
+            }
+            for row, entry in rows
+        ]
+
     async def delete_product(self, product_id: uuid.UUID) -> None:
         product = await self.get_product(product_id)
+        if await self.products.has_fuel_entry_oil_rows(product_id):
+            raise ConflictError(
+                "This product has been sold in one or more fuel entries and cannot be deleted."
+            )
         await self.products.delete(product)

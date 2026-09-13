@@ -83,6 +83,18 @@ async def delete_employee(employee_id: uuid.UUID, session: AsyncSession = Depend
     return Message(detail="Employee deleted.")
 
 
+@router.delete("/{employee_id}/salary-history/{revision_id}", response_model=EmployeeOut)
+async def delete_salary_revision(
+    employee_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_manager_or_admin),
+) -> EmployeeOut:
+    service = EmployeeService(session)
+    employee = await service.delete_salary_revision(employee_id, revision_id)
+    return EmployeeOut.model_validate(employee)
+
+
 @router.post("/{employee_id}/credits", response_model=EmployeeOut, status_code=status.HTTP_201_CREATED)
 async def add_employee_credit(
     employee_id: uuid.UUID,

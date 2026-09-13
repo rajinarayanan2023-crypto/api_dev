@@ -1,4 +1,3 @@
-import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -11,12 +10,6 @@ from app.models.user import User
 from app.repositories.offer_repository import OfferSendRepository
 from app.schemas.offer import OfferSendCreate
 from app.services.audit import attach_actor_names
-
-
-def _attach_recipient_names(sends: list[OfferSend], names: dict[uuid.UUID, str]) -> None:
-    for send in sends:
-        for r in send.recipients:
-            r.customer_name = names.get(r.offer_customer_id, "Unknown customer")
 
 
 def _attach_status_counts(sends: list[OfferSend]) -> None:
@@ -33,14 +26,18 @@ class OfferService:
         self.sends = OfferSendRepository(session)
 
     async def send(self, data: OfferSendCreate, actor: User) -> OfferSend:
+        # De-duplicated (preserving order) — offer_customers has no unique
+        # constraint tying a send to a customer any more (see
+        # OfferSendRecipient's docstring), so a request naming the same id
+        # twice would otherwise silently create two identical recipient rows.
+        customer_ids = list(dict.fromkeys(data.customer_ids))
         result = await self.session.execute(
             select(OfferCustomer.id, OfferCustomer.name, OfferCustomer.phone).where(
-                OfferCustomer.id.in_(data.customer_ids)
+                OfferCustomer.id.in_(customer_ids)
             )
         )
-        rows = result.all()
-        found = {row[0]: (row[1], row[2]) for row in rows}
-        missing = set(data.customer_ids) - found.keys()
+        found = {row[0]: (row[1], row[2]) for row in result.all()}
+        missing = set(customer_ids) - found.keys()
         if missing:
             raise NotFoundError("One or more selected customers no longer exist.")
 
@@ -54,9 +51,12 @@ class OfferService:
             updated_by=actor.id,
         )
         recipients = []
-        for customer_id in data.customer_ids:
-            _, phone = found[customer_id]
-            recipient = OfferSendRecipient(offer_customer_id=customer_id)
+        for customer_id in customer_ids:
+            name, phone = found[customer_id]
+            # Snapshot the name now — this row never looks the customer up
+            # again, so it reads the same after the customer is renamed or
+            # deleted (see OfferSendRecipient's docstring).
+            recipient = OfferSendRecipient(customer_name=name)
             if not phone:
                 recipient.status = "blocked"
                 recipient.provider_response = "No phone number on file."
@@ -78,20 +78,11 @@ class OfferService:
         # re-fetch with recipients eagerly loaded so serialization is safe.
         full = await self.sends.get_with_recipients(created.id)
         await attach_actor_names(self.session, [full])
-        names = {cid: name for cid, (name, _phone) in found.items()}
-        _attach_recipient_names([full], names)
         _attach_status_counts([full])
         return full
 
     async def list_history(self, offset: int = 0, limit: int = 100) -> list[OfferSend]:
         sends = await self.sends.list_with_recipients(offset=offset, limit=limit)
         await attach_actor_names(self.session, sends)
-
-        ids = {r.offer_customer_id for send in sends for r in send.recipients}
-        names: dict[uuid.UUID, str] = {}
-        if ids:
-            result = await self.session.execute(select(OfferCustomer.id, OfferCustomer.name).where(OfferCustomer.id.in_(ids)))
-            names = dict(result.all())
-        _attach_recipient_names(sends, names)
         _attach_status_counts(sends)
         return sends

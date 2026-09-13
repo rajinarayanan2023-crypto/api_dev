@@ -2,6 +2,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache import invalidate_dashboard_month
 from app.core.exceptions import ConflictError, NotFoundError
 from app.models.expense import ExpenseDay, ExpenseItem
 from app.models.user import User
@@ -23,6 +24,7 @@ class ExpenseService:
         day = ExpenseDay(date=data.date, created_by=actor.id, updated_by=actor.id)
         day.items = [ExpenseItem(label=item.label, amount=item.amount) for item in data.items]
         created = await self.expense_days.create(day)
+        invalidate_dashboard_month(created.date.strftime("%Y-%m"))
         return await self.get_expense_day(created.id)
 
     async def list_expense_days(self, offset: int = 0, limit: int = 200) -> list[ExpenseDay]:
@@ -39,6 +41,7 @@ class ExpenseService:
 
     async def update_expense_day(self, expense_day_id: uuid.UUID, data: ExpenseDayUpdate, actor: User) -> ExpenseDay:
         day = await self.get_expense_day(expense_day_id)
+        previous_month = day.date.strftime("%Y-%m")
 
         if data.date != day.date:
             existing = await self.expense_days.get_by_date(data.date)
@@ -52,8 +55,11 @@ class ExpenseService:
         day.items = [ExpenseItem(label=item.label, amount=item.amount) for item in data.items]
         day.updated_by = actor.id
         await self.session.flush()
+        invalidate_dashboard_month(previous_month)
+        invalidate_dashboard_month(day.date.strftime("%Y-%m"))
         return await self.get_expense_day(expense_day_id)
 
     async def delete_expense_day(self, expense_day_id: uuid.UUID) -> None:
         day = await self.get_expense_day(expense_day_id)
+        invalidate_dashboard_month(day.date.strftime("%Y-%m"))
         await self.expense_days.delete(day)

@@ -53,6 +53,9 @@ class CreditCustomerService:
         ]
 
     async def create(self, data: CreditCustomerCreate, actor: User) -> CreditCustomer:
+        if await self.customers.get_by_name_and_phone(data.name, data.phone) is not None:
+            raise ConflictError("A customer with this same name and phone number already exists.")
+
         customer = CreditCustomer(
             name=data.name,
             phone=data.phone,
@@ -84,6 +87,15 @@ class CreditCustomerService:
         if customer is None:
             raise NotFoundError("Credit customer not found.")
         updates = data.model_dump(exclude_unset=True, exclude={"bills"})
+
+        if "name" in updates or "phone" in updates:
+            new_name = updates.get("name", customer.name)
+            new_phone = updates.get("phone", customer.phone)
+            existing = await self.customers.get_by_name_and_phone(new_name, new_phone, exclude_id=customer.id)
+            if existing is not None:
+                raise ConflictError("A customer with this same name and phone number already exists.")
+
+
         for field, value in updates.items():
             setattr(customer, field, value)
         removed_keys: set[str] = set()
@@ -102,6 +114,19 @@ class CreditCustomerService:
         customer = await self.customers.get_with_details(customer_id)
         if customer is None:
             raise NotFoundError("Credit customer not found.")
+        # Credit_Ledger_Entries.customer_id cascades on delete, so the DB
+        # itself would silently let this through and wipe out every ledger
+        # row a real Fuel Entry created for this customer — including the
+        # link back to it (source_fuel_entry_id) — instead of rejecting it.
+        # Mirrors the same guard on Lubricant product deletion
+        # (has_fuel_entry_oil_rows) and on removing a single ledger entry
+        # directly (delete_ledger_entry below): a Fuel-Entry-sourced link
+        # only ever goes away by deleting that fuel entry itself.
+        if any(entry.source_fuel_entry_id is not None for entry in customer.ledger_entries):
+            raise ConflictError(
+                "This customer has ledger entries linked to a Fuel Entry and can't be deleted. "
+                "Delete the linked fuel entries first."
+            )
         # Every bill/document tied to this customer — its own Bills &
         # Documents plus any per-ledger-entry attachment — is about to
         # cascade-delete in Postgres along with it; clean up the matching R2

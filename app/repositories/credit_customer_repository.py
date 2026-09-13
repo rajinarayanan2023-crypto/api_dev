@@ -1,6 +1,6 @@
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,6 +16,23 @@ _WITH_DETAIL = (
 class CreditCustomerRepository(BaseRepository[CreditCustomer]):
     def __init__(self, session: AsyncSession):
         super().__init__(CreditCustomer, session)
+
+    # name + phone together is what actually identifies a customer (same
+    # reasoning as Employee's name + father_name check) — same name alone
+    # isn't a real collision on its own, two different people can share one.
+    # Case/whitespace-insensitive; a missing phone on both sides (NULL, via
+    # coalesce) still counts as a match rather than as "different".
+    async def get_by_name_and_phone(
+        self, name: str, phone: str | None, exclude_id: uuid.UUID | None = None
+    ) -> CreditCustomer | None:
+        query = select(CreditCustomer).where(
+            func.lower(CreditCustomer.name) == name.strip().lower(),
+            func.coalesce(CreditCustomer.phone, "") == (phone or "").strip(),
+        )
+        if exclude_id is not None:
+            query = query.where(CreditCustomer.id != exclude_id)
+        result = await self.session.execute(query)
+        return result.scalars().first()
 
     async def get_ledger_entry(self, entry_id: uuid.UUID) -> CreditLedgerEntry | None:
         result = await self.session.execute(select(CreditLedgerEntry).where(CreditLedgerEntry.id == entry_id))

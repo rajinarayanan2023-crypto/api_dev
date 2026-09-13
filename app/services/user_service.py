@@ -2,7 +2,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import ConflictError, NotFoundError, UnauthorizedError
+from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.security import hash_password, verify_password
 from app.models.user import User
 from app.repositories.refresh_token_repository import RefreshTokenRepository
@@ -53,7 +53,13 @@ class UserService:
 
     async def change_password(self, user: User, data: PasswordChange) -> None:
         if not verify_password(data.current_password, user.password_hash):
-            raise UnauthorizedError("Current password is incorrect.")
+            # NOT UnauthorizedError (401) — this is an authenticated request
+            # (a valid access token got the caller here at all), so a 401
+            # here would be indistinguishable from an expired/invalid token
+            # to apiClient.js's global interceptor, which logs the user out
+            # on ANY 401 from an authenticated call. A wrong current password
+            # is a plain validation failure, not a session problem.
+            raise AppError("Current password is incorrect.")
         user.password_hash = hash_password(data.new_password)
         await self.session.flush()
         # Changing the password invalidates every existing session so a

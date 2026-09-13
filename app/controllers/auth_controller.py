@@ -7,10 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_active_user, get_db_session
 from app.core.config import get_settings
 from app.core.exceptions import ForbiddenError, UnauthorizedError
-from app.core.otp_store import generate_otp, verify_otp
+from app.core.email import send_email
+from app.core.otp_store import generate_otp, otp_expiry_phrase, verify_otp
 from app.core.rate_limit import limiter
 from app.core.security import DUMMY_PASSWORD_HASH, verify_password
-from app.core.sms import get_sms_provider
 from app.models.user import User
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import (
@@ -29,6 +29,77 @@ from app.services.user_service import UserService
 
 settings = get_settings()
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _otp_email_text(otp: str, expiry_phrase: str) -> str:
+    """Plain-text fallback for mail clients that don't render the HTML
+    alternative below — same wording, no styling.
+    """
+    return (
+        "Hello,\n\n"
+        f"Your One-Time Password (OTP) for logging in to GM Agency App is:\n\n"
+        f"{otp}\n\n"
+        f"This OTP is valid for {expiry_phrase}. Please do not share this OTP with anyone.\n\n"
+        "If you did not request this OTP, you can safely ignore this email.\n\n"
+        "Regards,\n"
+        "GM Agency Software Team"
+    )
+
+
+def _otp_email_html(otp: str, expiry_phrase: str) -> str:
+    """Colorful HTML template for the login OTP email — gold/navy to match
+    the app's own brand palette (see ui/tailwind.config.js's brand.* scale).
+    Table-based layout with inline styles only, since that's what actually
+    renders consistently across Gmail/Outlook/etc.
+    """
+    return f"""\
+<div style="background:#f1f5f9;padding:32px 16px;font-family:'Segoe UI',Arial,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="480" cellpadding="0" cellspacing="0"
+               style="max-width:480px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 8px 30px rgba(15,23,42,0.15);">
+          <tr>
+            <td style="background:linear-gradient(135deg,#f5a800,#c9911c 60%,#8a5c10);padding:28px 32px;text-align:center;">
+              <div style="font-size:22px;font-weight:700;color:#ffffff;letter-spacing:1px;">GM AGENCY</div>
+              <div style="font-size:13px;color:#fde8b8;margin-top:4px;">Fuel Station Management</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:32px;">
+              <p style="margin:0 0 16px;font-size:15px;color:#334155;">Hello,</p>
+              <p style="margin:0 0 22px;font-size:15px;color:#334155;line-height:1.6;">
+                Your One-Time Password (OTP) for logging in to <strong>GM Agency App</strong> is:
+              </p>
+              <div style="text-align:center;margin:24px 0;">
+                <span style="display:inline-block;background:linear-gradient(135deg,#fff4de,#ffe6ad);border:1.5px solid #f0b429;color:#8a5c10;font-size:32px;font-weight:800;letter-spacing:8px;padding:14px 28px;border-radius:12px;">
+                  {otp}
+                </span>
+              </div>
+              <p style="margin:0 0 8px;font-size:13.5px;color:#64748b;text-align:center;">
+                This OTP is valid for <strong style="color:#c9911c;">{expiry_phrase}</strong>.
+              </p>
+              <p style="margin:0 0 20px;font-size:13px;color:#e11d48;text-align:center;font-weight:600;">
+                Please do not share this OTP with anyone.
+              </p>
+              <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0;">
+              <p style="margin:0;font-size:12.5px;color:#94a3b8;">
+                If you did not request this OTP, you can safely ignore this email.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="background:#0f172a;padding:18px 32px;text-align:center;">
+              <p style="margin:0;font-size:12px;color:#94a3b8;">Regards,</p>
+              <p style="margin:2px 0 0;font-size:13px;color:#f5a800;font-weight:700;">GM Agency Software Team</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</div>
+"""
 
 
 @router.post("/login", response_model=LoginOtpResponse)
@@ -60,8 +131,19 @@ async def login(
         raise invalid_credentials
 
     otp = generate_otp(str(user.id))
-    await get_sms_provider().send(
-        user.phone, f"Your {settings.app_name} login code is {otp}. It expires in 5 minutes."
+    # OTP now goes to the user's registered email, not SMS — a real SMS send
+    # costs money per login (see app/core/sms.py/Fast2SMSProvider, still used
+    # by the Offers module), while email is free via the existing SMTP setup.
+    # This is a login-only change: Offers' SMS channel is untouched. from_name
+    # overrides the sender display name just for this email — audit report
+    # emails keep the default settings.smtp_from_name.
+    expiry = otp_expiry_phrase()
+    send_email(
+        user.email,
+        "Welcome to the GM Agency App - Your OTP code",
+        _otp_email_text(otp, expiry),
+        html_body=_otp_email_html(otp, expiry),
+        from_name="GM Agency App OTP",
     )
     return LoginOtpResponse(message="OTP sent.", user_id=str(user.id))
 

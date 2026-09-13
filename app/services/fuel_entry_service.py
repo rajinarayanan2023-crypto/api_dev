@@ -6,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache import invalidate_dashboard_month
 from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.s3 import delete_object
 from app.models.attendance import AttendanceRecord
@@ -136,7 +137,7 @@ class FuelEntryService:
             for b in data.bills
         ]
 
-    async def _apply_write(self, entry: FuelEntry, data: FuelEntryWrite) -> None:
+    async def _apply_write(self, entry: FuelEntry, data: FuelEntryWrite) -> set[str]:
         entry.date = data.date
         entry.pump_key = data.pump_key
         entry.shift_number = data.shift_number
@@ -168,11 +169,19 @@ class FuelEntryService:
         # changed. Diff by key first, then only the genuinely-removed keys
         # get their R2 object deleted — every unchanged bill costs zero R2
         # calls and zero DB writes.
+        #
+        # The actual R2 deletion is NOT done here — it's the caller's job,
+        # only after the surrounding save has actually succeeded (see
+        # create()/update() below). delete_object() is irreversible and
+        # can't be rolled back the way this transaction can; doing it this
+        # early ran it before the entry's own flush() (and, on update, its
+        # side-effect cascade) had a chance to fail. A later failure would
+        # roll back the DB change while the R2 object stayed deleted —
+        # leaving a bill ROW pointing at a file that no longer exists.
         existing_bills = list(entry.bills)
         removed_keys = {b.file_url for b in existing_bills} - {b.file_url for b in data.bills}
         entry.bills = self._build_bills(data, existing_bills)
-        for key in removed_keys:
-            delete_object(key)
+        return removed_keys
 
     # ---------- serialization ----------
 
@@ -427,7 +436,7 @@ class FuelEntryService:
         # if data.status == "final" and not data.bills:
         #     raise AppError("At least one bill is required to finalize a shift entry.")
         entry = FuelEntry(created_by=actor.id, updated_by=actor.id)
-        await self._apply_write(entry, data)
+        removed_bill_keys = await self._apply_write(entry, data)
         self.session.add(entry)
         try:
             await self.session.flush()
@@ -437,9 +446,16 @@ class FuelEntryService:
             raise
         if data.status == "final":
             await self._apply_side_effects(entry, actor)
+        invalidate_dashboard_month(entry.date.strftime("%Y-%m"))
         full = await self.entries.get_with_details(entry.id)
         await attach_actor_names(self.session, [full])
-        return await self._serialize(full)
+        result = await self._serialize(full)
+        # Only now, with everything else already flushed successfully (a new
+        # entry never actually has removed bills, but this stays symmetric
+        # with update() below rather than special-casing it away).
+        for key in removed_bill_keys:
+            delete_object(key)
+        return result
 
     async def update(self, entry_id: uuid.UUID, data: FuelEntryWrite, actor: User) -> dict:
         # Bill-upload requirement temporarily disabled — a fuel entry can be
@@ -454,6 +470,7 @@ class FuelEntryService:
         existing = await self.entries.get_with_details_for_update(entry_id)
         if existing is None:
             raise NotFoundError("Fuel entry not found.")
+        previous_month = existing.date.strftime("%Y-%m")
 
         # Reverse this entry's previous side effects before rebuilding it —
         # attendance is intentionally NOT reversed here (see class docstring),
@@ -463,7 +480,7 @@ class FuelEntryService:
         await self._remove_credit_ledger_by_source(entry_id)
         await self._remove_employee_credit_by_source(entry_id)
 
-        await self._apply_write(existing, data)
+        removed_bill_keys = await self._apply_write(existing, data)
         existing.updated_by = actor.id
         try:
             await self.session.flush()
@@ -475,9 +492,17 @@ class FuelEntryService:
         if data.status == "final":
             await self._apply_side_effects(existing, actor)
 
+        invalidate_dashboard_month(previous_month)
+        invalidate_dashboard_month(data.date.strftime("%Y-%m"))
         full = await self.entries.get_with_details(entry_id)
         await attach_actor_names(self.session, [full])
-        return await self._serialize(full)
+        result = await self._serialize(full)
+        # Only now that the flush and the side-effect cascade have both
+        # actually succeeded — see _apply_write's docstring comment on why
+        # this can't happen any earlier.
+        for key in removed_bill_keys:
+            delete_object(key)
+        return result
 
     async def delete(self, entry_id: uuid.UUID) -> None:
         existing = await self.entries.get_with_details(entry_id)
@@ -488,6 +513,7 @@ class FuelEntryService:
         await self._remove_credit_ledger_by_source(entry_id)
         await self._remove_employee_credit_by_source(entry_id)
         bill_keys = [b.file_url for b in existing.bills]
+        invalidate_dashboard_month(existing.date.strftime("%Y-%m"))
         await self.entries.delete(existing)
         for key in bill_keys:
             delete_object(key)

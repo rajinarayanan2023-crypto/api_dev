@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Text, UniqueConstraint, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -9,11 +9,15 @@ from app.models.base import AuditMixin, Base, UUIDPkMixin
 
 
 class OfferCustomer(Base, UUIDPkMixin):
-    """Standalone recipient list for offers — deliberately NOT linked to
-    Employees or Credit_Customers (those are different domains; an offer
-    recipient may not be a credit customer at all). Deactivate via `active`
-    instead of deleting, so past Offer_Send_Recipients rows keep a real name
-    to display.
+    """Standalone recipient list for offers — deliberately not linked, at
+    the database level, to Employees, Credit_Customers, OR Offer_Send_Recipients
+    (below): a send's recipient rows snapshot the customer's name at send
+    time instead of holding a live FK back here, so this table has nothing
+    else in the schema referencing it. `active` still exists for
+    programmatic use, but the Offers screen itself hard-deletes a removed
+    recipient (see OfferCustomerService.delete) rather than deactivating —
+    and since nothing references this table, that delete has zero side
+    effects anywhere else, past send history included.
     """
 
     __tablename__ = "offer_customers"
@@ -52,20 +56,23 @@ class OfferSend(Base, UUIDPkMixin, AuditMixin):
 
 
 class OfferSendRecipient(Base, UUIDPkMixin):
+    """No FK to offer_customers — customer_name is a snapshot taken at send
+    time (see OfferService.send), not a live join. This is what makes
+    offer_customers a genuinely standalone table: deleting a customer can
+    never affect a past send's recipient list, because nothing here points
+    back at it.
+    """
+
     __tablename__ = "Offer_Send_Recipients"
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'sent', 'failed', 'blocked')", name="ck_offer_send_recipients_status"),
-        UniqueConstraint("offer_send_id", "offer_customer_id", name="uq_offer_send_recipients_send_customer"),
         Index("idx_offer_send_recipients_send", "offer_send_id"),
-        Index("idx_offer_send_recipients_customer", "offer_customer_id"),
     )
 
     offer_send_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("Offer_Sends.id", ondelete="CASCADE"), nullable=False
     )
-    offer_customer_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("offer_customers.id", ondelete="CASCADE"), nullable=False
-    )
+    customer_name: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
     # Raw text from the provider (an error message, or a provider message
     # id on success) — kept simple rather than a JSON column since neither

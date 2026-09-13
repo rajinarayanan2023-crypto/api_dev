@@ -28,6 +28,15 @@ class CommissionRateRepository(BaseRepository[CommissionRateHistory]):
         )
         return result.scalar_one_or_none()
 
+    # Dashboard summary aggregation — the full history, ascending, so the
+    # caller can resolve "the rate in force on date X" per fuel entry with an
+    # in-memory scan instead of one get_current() query per entry.
+    async def list_all_ascending(self) -> list[CommissionRateHistory]:
+        result = await self.session.execute(
+            select(CommissionRateHistory).order_by(CommissionRateHistory.effective_from.asc())
+        )
+        return list(result.scalars().all())
+
     async def list_all(self, offset: int = 0, limit: int = 200) -> list[CommissionRateHistory]:
         result = await self.session.execute(
             select(CommissionRateHistory)

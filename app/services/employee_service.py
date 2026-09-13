@@ -16,6 +16,11 @@ class EmployeeService:
         self.employees = EmployeeRepository(session)
 
     async def create_employee(self, data: EmployeeCreate, actor: User) -> Employee:
+        if await self.employees.get_by_name_and_father_name(data.name, data.father_name) is not None:
+            raise ConflictError("An employee with this same name and father's name already exists.")
+        if data.phone and await self.employees.get_by_phone(data.phone) is not None:
+            raise ConflictError("This phone number is already used by another employee.")
+
         payload = data.model_dump(exclude={"starting_salary"})
         employee = Employee(**payload, created_by=actor.id, updated_by=actor.id)
         employee.salary_history = [
@@ -46,6 +51,18 @@ class EmployeeService:
     async def update_employee(self, employee_id: uuid.UUID, data: EmployeeUpdate, actor: User) -> Employee:
         employee = await self.get_employee(employee_id)
         updates = data.model_dump(exclude_unset=True)
+
+        if "name" in updates or "father_name" in updates:
+            new_name = updates.get("name", employee.name)
+            new_father_name = updates.get("father_name", employee.father_name)
+            existing = await self.employees.get_by_name_and_father_name(new_name, new_father_name, exclude_id=employee.id)
+            if existing is not None:
+                raise ConflictError("An employee with this same name and father's name already exists.")
+        if updates.get("phone"):
+            existing = await self.employees.get_by_phone(updates["phone"], exclude_id=employee.id)
+            if existing is not None:
+                raise ConflictError("This phone number is already used by another employee.")
+
         for field, value in updates.items():
             setattr(employee, field, value)
         if updates:
@@ -86,6 +103,25 @@ class EmployeeService:
             # it so get_employee() below actually re-reads it from the DB
             # instead of returning the cached (pre-insert) collection.
             self.session.expire(employee, ["salary_history"])
+        return await self.get_employee(employee_id)
+
+    # Salary history is otherwise append-only (see add_salary_revision's own
+    # upsert-by-date comment above) — this is deliberately the one way out
+    # for a revision added with the wrong amount AND the wrong date, where
+    # the upsert-by-date trick above can't reach it (that only overwrites an
+    # entry sharing the SAME effective_from). Blocked on the last remaining
+    # entry: an employee always needs at least one row to derive "current
+    # pay" from (see sortedSalaryHistory/currentSalary on the frontend).
+    async def delete_salary_revision(self, employee_id: uuid.UUID, revision_id: uuid.UUID) -> Employee:
+        employee = await self.get_employee(employee_id)
+        revision = next((h for h in employee.salary_history if h.id == revision_id), None)
+        if revision is None:
+            raise NotFoundError("Salary revision not found.")
+        if len(employee.salary_history) <= 1:
+            raise ConflictError("An employee must have at least one salary revision on record.")
+        employee.salary_history.remove(revision)
+        await self.session.flush()
+        self.session.expire(employee, ["salary_history"])
         return await self.get_employee(employee_id)
 
     async def delete_employee(self, employee_id: uuid.UUID) -> None:

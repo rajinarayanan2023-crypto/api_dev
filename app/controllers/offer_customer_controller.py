@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_user, get_db_session, require_manager_or_admin
+from app.schemas.common import Message
 from app.schemas.offer_customer import OfferCustomerCreate, OfferCustomerOut, OfferCustomerUpdate
 from app.services.offer_customer_service import OfferCustomerService
 
@@ -40,3 +41,14 @@ async def update_offer_customer(
     service = OfferCustomerService(session)
     customer = await service.update(customer_id, body)
     return OfferCustomerOut.model_validate(customer)
+
+
+@router.delete(
+    "/{customer_id}", response_model=Message, dependencies=[Depends(require_manager_or_admin)]
+)
+async def delete_offer_customer(
+    customer_id: uuid.UUID, session: AsyncSession = Depends(get_db_session)
+) -> Message:
+    service = OfferCustomerService(session)
+    await service.delete(customer_id)
+    return Message(detail="Offer customer deleted.")

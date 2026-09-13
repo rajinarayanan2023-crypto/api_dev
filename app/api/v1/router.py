@@ -4,6 +4,7 @@ from app.controllers.attendance_controller import router as attendance_router
 from app.controllers.auth_controller import router as auth_router
 from app.controllers.commission_controller import router as commission_router
 from app.controllers.credit_customer_controller import router as credit_customer_router
+from app.controllers.dashboard_controller import router as dashboard_router
 from app.controllers.employee_controller import router as employee_router
 from app.controllers.expense_controller import router as expense_router
 from app.controllers.fuel_entry_controller import router as fuel_entry_router
@@ -24,6 +25,7 @@ api_router.include_router(lubricant_router)
 api_router.include_router(expense_router)
 api_router.include_router(commission_router)
 api_router.include_router(credit_customer_router)
+api_router.include_router(dashboard_router)
 api_router.include_router(offer_router)
 api_router.include_router(offer_customer_router)
 api_router.include_router(fuel_entry_router)

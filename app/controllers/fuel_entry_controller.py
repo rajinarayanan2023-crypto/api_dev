@@ -1,10 +1,11 @@
 import uuid
 from datetime import date
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_user, get_db_session, require_manager_or_admin
+from app.core.email import send_email
 from app.models.user import User
 from app.schemas.fuel_entry import FuelEntryOut, FuelEntryWrite
 from app.services.fuel_entry_service import FuelEntryService
@@ -64,3 +65,27 @@ async def delete_fuel_entry(
 ) -> None:
     service = FuelEntryService(session)
     await service.delete(entry_id)
+
+
+# The audit report AuditModal builds (see FuelEntryForm.jsx/AuditModal.jsx)
+# is a whole-day, both-pumps report — optionally the separate Shift 3
+# variant — never a single Fuel_Entries row, so there's no {entry_id} to
+# scope this on the way the other routes above do. The .xlsx itself is
+# already fully assembled client-side (buildWorkbookBlob) and sent up as-is
+# here purely as the email attachment — this endpoint only ever sends it,
+# it never re-derives or re-validates the report's own numbers.
+@router.post("/send-audit-email", status_code=status.HTTP_204_NO_CONTENT)
+async def send_audit_email(
+    to_email: str = Form(...),
+    subject: str = Form(...),
+    body_text: str = Form(...),
+    attachment: UploadFile = File(...),
+) -> None:
+    attachment_bytes = await attachment.read()
+    send_email(
+        to=to_email,
+        subject=subject,
+        body_text=body_text,
+        attachment_bytes=attachment_bytes,
+        attachment_filename=attachment.filename or "audit-report.xlsx",
+    )

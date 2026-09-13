@@ -45,12 +45,20 @@ class EmployeeBase(BaseModel):
 
 
 class EmployeeCreate(EmployeeBase):
+    # Overrides EmployeeBase's optional father_name — required for a NEW
+    # employee. Left optional on EmployeeBase/EmployeeOut instead of tightened
+    # there too, since at least one existing employee predates this rule and
+    # still has none on file; EmployeeOut has to keep serializing that row.
+    father_name: str = Field(min_length=1, max_length=255)
     starting_salary: Decimal = Field(gt=0, max_digits=10, decimal_places=2)
 
 
 class EmployeeUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
-    father_name: str | None = Field(default=None, max_length=255)
+    # Still omittable (a partial update that doesn't touch this field), but
+    # can't be sent as an empty string — this is what stops an existing
+    # employee's father_name from being cleared back out once set.
+    father_name: str | None = Field(default=None, min_length=1, max_length=255)
     role: str | None = Field(default=None, min_length=1, max_length=100)
     phone: str | None = Field(default=None, max_length=20)
     join_date: date | None = None

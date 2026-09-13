@@ -1,5 +1,13 @@
 import uuid
 from datetime import date, datetime
+# Aliased for PurchaseUpdate's `date` field below — `date: date | None = ...`
+# breaks at class-definition time: Python binds the field's default value to
+# the name `date` in the class namespace BEFORE evaluating that same line's
+# `date | None` annotation, so the annotation resolves against `None`
+# instead of the datetime class, raising "unsupported operand type(s) for
+# |: 'NoneType' and 'NoneType'". Only a field literally named `date` with a
+# default hits this; the alias sidesteps it entirely.
+from datetime import date as _date
 from decimal import Decimal
 from typing import Literal
 
@@ -27,11 +35,34 @@ class PurchaseCreate(BaseModel):
     cost: Decimal = Field(ge=0, max_digits=10, decimal_places=2)
 
 
+# Correcting a mis-entered purchase — qty stays a whole int (never a
+# fraction, same as PurchaseCreate above); LubricantService.update_purchase
+# is what actually blocks a correction that would drive stock negative.
+class PurchaseUpdate(BaseModel):
+    date: _date | None = None
+    qty: int | None = Field(default=None, gt=0)
+    cost: Decimal | None = Field(default=None, ge=0, max_digits=10, decimal_places=2)
+
+
 class PurchaseOut(ORMModel):
     id: uuid.UUID
     date: date
     qty: int
     cost: Decimal
+
+
+class SoldHistoryEntryOut(BaseModel):
+    """One Fuel Entry oil row that sold this product — only ever sourced
+    from a 'final' shift entry (a draft's rows aren't a real sale yet)."""
+
+    fuel_entry_id: uuid.UUID
+    date: date
+    pump_key: str
+    shift_number: int
+    row_type: Literal["pocket", "cane"]
+    qty: Decimal
+    rate: Decimal
+    amount: Decimal
 
 
 class LubricantBase(BaseModel):
@@ -56,6 +87,11 @@ class LubricantOut(LubricantBase, ORMModel):
     stock: Decimal
     price_history: list[PriceHistoryOut] = []
     purchase_history: list[PurchaseOut] = []
+    # Set by LubricantService from a separate aggregate query (see
+    # get_sales_summary) — not a real column on LubricantProduct, so both
+    # default to None/0 for a product that's never sold a unit.
+    last_sold_date: date | None = None
+    total_sold: Decimal = Decimal("0")
     created_at: datetime
     updated_at: datetime
     created_by: uuid.UUID | None = None

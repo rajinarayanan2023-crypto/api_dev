@@ -15,6 +15,12 @@ class AttendanceStatus(str, enum.Enum):
     ABSENT = "absent"
     LEAVE = "leave"
     DUTY_OFF = "duty_off"
+    # A company-declared off day (holiday/closure) — unlike DUTY_OFF, this
+    # one counts as a paid day worked (see shiftUnits in ui/src/utils/
+    # attendance.js) and is never treated as an absence/leave (see
+    # FuelEntryForm's unavailableEmployeeIds), so the employee still shows as
+    # assignable to a shift on it.
+    COMPANY_OFF = "company_off"
 
 
 class AttendanceRecord(Base, UUIDPkMixin, AuditMixin):
@@ -22,7 +28,7 @@ class AttendanceRecord(Base, UUIDPkMixin, AuditMixin):
     __table_args__ = (
         UniqueConstraint("employee_id", "date", name="uq_attendance_records_employee_date"),
         CheckConstraint(
-            "status IN ('one_shift', 'double_shift', 'absent', 'leave', 'duty_off')",
+            "status IN ('one_shift', 'double_shift', 'absent', 'leave', 'duty_off', 'company_off')",
             name="ck_attendance_records_status",
         ),
         Index("idx_attendance_employee_date", "employee_id", "date"),

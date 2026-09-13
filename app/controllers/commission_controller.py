@@ -1,3 +1,4 @@
+import uuid
 from datetime import date
 
 from fastapi import APIRouter, Depends, Query, status
@@ -6,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_active_user, get_db_session, require_manager_or_admin
 from app.models.user import User
 from app.schemas.commission import CommissionRateCreate, CommissionRateOut
+from app.schemas.common import Message
 from app.services.commission_service import CommissionRateService
 
 router = APIRouter(
@@ -45,3 +47,10 @@ async def list_rates(
     service = CommissionRateService(session)
     rates = await service.list_all(offset=offset, limit=limit)
     return [CommissionRateOut.model_validate(r) for r in rates]
+
+
+@router.delete("/{rate_id}", response_model=Message, dependencies=[Depends(require_manager_or_admin)])
+async def delete_rate(rate_id: uuid.UUID, session: AsyncSession = Depends(get_db_session)) -> Message:
+    service = CommissionRateService(session)
+    await service.delete(rate_id)
+    return Message(detail="Commission rate revision deleted.")

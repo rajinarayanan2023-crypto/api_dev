@@ -18,7 +18,6 @@ class OfferSendCreate(BaseModel):
 
 
 class OfferSendRecipientOut(ORMModel):
-    offer_customer_id: uuid.UUID
     customer_name: str
     status: RecipientStatus
     provider_response: str | None = None

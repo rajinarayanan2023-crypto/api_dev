@@ -9,8 +9,22 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-OTP_EXPIRE_MINUTES = 5
+OTP_EXPIRE_MINUTES = 1.5
 OTP_MAX_ATTEMPTS = 3
+
+
+# Human-readable phrasing of OTP_EXPIRE_MINUTES for the SMS text itself (see
+# auth_controller.login) — kept next to the constant so the two can never
+# drift out of sync the way a separately hand-typed "5 minutes" string did.
+def otp_expiry_phrase() -> str:
+    total_seconds = round(OTP_EXPIRE_MINUTES * 60)
+    minutes, seconds = divmod(total_seconds, 60)
+    parts = []
+    if minutes:
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if seconds:
+        parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+    return " ".join(parts) or "0 seconds"
 
 otp_store: dict[str, dict] = {}  # user_id -> {otp, expires_at, attempts}
 

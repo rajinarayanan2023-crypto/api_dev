@@ -22,6 +22,13 @@ from app.core.exceptions import AppError
 from app.core.middleware import SecurityHeadersMiddleware
 from app.core.rate_limit import limiter
 
+# Python's root logger defaults to WARNING with no handler attached, so
+# every logger.info() across this codebase (dashboard cache hit/miss,
+# R2 delete_object, etc.) was being silently dropped — never actually
+# reaching uvicorn's console/log output, only warning/error/exception calls
+# were. This makes INFO visible app-wide without touching every call site.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
+
 settings = get_settings()
 logger = logging.getLogger("app")
 

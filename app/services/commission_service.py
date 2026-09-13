@@ -1,7 +1,9 @@
+import uuid
 from datetime import date
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache import invalidate_dashboard_from_month
 from app.core.exceptions import NotFoundError
 from app.models.commission import CommissionRateHistory
 from app.models.user import User
@@ -21,6 +23,10 @@ class CommissionRateService:
     # plain insert would otherwise raise IntegrityError for what the manager
     # sees as an edit. Same pattern as employee salary / lubricant price history.
     async def create_or_revise(self, data: CommissionRateCreate, actor: User) -> CommissionRateHistory:
+        # A revision changes the applicable rate for this month AND every
+        # later one already cached (until a later revision supersedes it
+        # again) — not just the exact month effective_from falls in.
+        invalidate_dashboard_from_month(data.effective_from.strftime("%Y-%m"))
         existing = await self.rates.get_by_date(data.effective_from)
         if existing is not None:
             existing.petrol = data.petrol
@@ -64,3 +70,13 @@ class CommissionRateService:
         rates = await self.rates.list_all(offset=offset, limit=limit)
         await attach_actor_names(self.session, rates)
         return rates
+
+    async def delete(self, rate_id: uuid.UUID) -> None:
+        rate = await self.rates.get(rate_id)
+        if rate is None:
+            raise NotFoundError("Commission rate revision not found.")
+        # Removing a revision changes the applicable rate for its own month
+        # AND every later cached month (until whatever rate comes next now
+        # applies instead) — same reasoning as create_or_revise above.
+        invalidate_dashboard_from_month(rate.effective_from.strftime("%Y-%m"))
+        await self.rates.delete(rate)

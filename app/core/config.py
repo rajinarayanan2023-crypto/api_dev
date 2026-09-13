@@ -46,9 +46,25 @@ class Settings(BaseSettings):
     # Expiry/max-attempts live in app/core/otp_store.py (in-memory, not DB
     # config) since they're not meant to be tuned per-deployment.
     otp_length: int = 6
-    # "dev" logs the OTP server-side instead of sending a real SMS — no
-    # provider account exists yet. See app/core/sms.py.
+    # "dev" logs the OTP (and any Offers SMS) server-side instead of sending
+    # anything real — the safe default everywhere, including production
+    # until this is deliberately switched. "fast2sms" sends for real via
+    # Fast2SMSProvider (app/core/sms.py). Same switch covers both the OTP
+    # login flow and the Offers module's SMS channel — one flag, one
+    # provider class, no separate implementations.
     sms_provider: str = "dev"
+
+    # --- SMS (Fast2SMS) ---
+    # Fast2SMS's quick-send route ("q") works immediately with just an API
+    # key — no DLT template registration needed — which is why it's used for
+    # now. Lazy-validated like R2/SMTP above: only required once a send is
+    # actually attempted (see Fast2SMSProvider.send), so the app still boots
+    # fine with SMS_PROVIDER=dev and this unset.
+    fast2sms_api_key: str = ""
+    # Unused by the quick-send route today. Once a DLT-approved template is
+    # approved, the production route needs this (plus a template/message id)
+    # — kept here now so switching later is a config change, not a rewrite.
+    fast2sms_sender_id: str = ""
 
     # --- File uploads ---
     # Local-disk storage (see app/main.py's StaticFiles mount) is now only a
@@ -72,6 +88,19 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_bucket_name: str = ""
 
+    # --- Email (SMTP) ---
+    # Same lazy pattern as R2 above: no default for the credential fields,
+    # left unset until real ones exist — only validated (in app/core/email.py)
+    # at the point the send-audit-email endpoint is actually called, so a
+    # deployment that doesn't use email yet can still start up without them.
+    # SMTP_APP_PASSWORD is a Gmail App Password (myaccount.google.com/apppasswords),
+    # NOT the account's real login password — Gmail rejects SMTP auth with the
+    # real password once 2FA is on, which it must be to issue an App Password.
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_app_password: str = ""
+    smtp_from_name: str = "GM Fuel Station Audit"
 
     @field_validator("secret_key")
     @classmethod
