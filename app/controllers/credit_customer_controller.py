@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_user, get_db_session, require_manager_or_admin
 from app.models.user import User
+from app.schemas.common import Message
 from app.schemas.credit_customer import (
     CreditCustomerCreate,
     CreditCustomerOut,
@@ -107,3 +108,14 @@ async def delete_ledger_entry(
 ) -> None:
     service = CreditCustomerService(session)
     await service.delete_ledger_entry(customer_id, entry_id)
+
+
+@router.post("/{customer_id}/send-reminder", response_model=Message)
+async def send_credit_reminder(
+    customer_id: uuid.UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Message:
+    service = CreditCustomerService(session)
+    await service.send_reminder(customer_id)
+    return Message(detail="Reminder sent.")

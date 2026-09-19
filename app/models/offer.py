@@ -41,9 +41,12 @@ class OfferSend(Base, UUIDPkMixin, AuditMixin):
     __table_args__ = (CheckConstraint("channel IN ('sms', 'whatsapp')", name="ck_offer_sends_channel"),)
 
     message: Mapped[str] = mapped_column(Text, nullable=False)
-    # Both channels are now dispatched server-side — see OfferService.send /
-    # core/sms.py — so every recipient gets a real per-channel provider
-    # response instead of the old client-side-only wa.me deep link.
+    # Dispatched server-side — see OfferService.send / core/sms.py — so
+    # every recipient gets a real provider response instead of the old
+    # client-side-only wa.me deep link. SMS was removed as a channel
+    # (OfferService.send now always writes "whatsapp"); the CHECK constraint
+    # below still allows "sms" only so old historical rows stay valid — no
+    # migration rewrites them, they just stop being written going forward.
     channel: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'sms'"))
     # Which quick-reply template (if any) seeded the message — purely
     # informational, shown in the history view.
@@ -56,11 +59,15 @@ class OfferSend(Base, UUIDPkMixin, AuditMixin):
 
 
 class OfferSendRecipient(Base, UUIDPkMixin):
-    """No FK to offer_customers — customer_name is a snapshot taken at send
-    time (see OfferService.send), not a live join. This is what makes
-    offer_customers a genuinely standalone table: deleting a customer can
-    never affect a past send's recipient list, because nothing here points
-    back at it.
+    """No FK to offer_customers — customer_name/customer_phone are a
+    snapshot taken at send time (see OfferService.send), not a live join.
+    This is what makes offer_customers a genuinely standalone table:
+    deleting a customer can never affect a past send's recipient list,
+    because nothing here points back at it.
+
+    customer_phone is nullable because rows sent before this column
+    existed have no phone recorded — it was never captured pre-migration,
+    so it can't be backfilled; only sends from here on carry it.
     """
 
     __tablename__ = "Offer_Send_Recipients"
@@ -73,6 +80,7 @@ class OfferSendRecipient(Base, UUIDPkMixin):
         UUID(as_uuid=True), ForeignKey("Offer_Sends.id", ondelete="CASCADE"), nullable=False
     )
     customer_name: Mapped[str] = mapped_column(Text, nullable=False)
+    customer_phone: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'pending'"))
     # Raw text from the provider (an error message, or a provider message
     # id on success) — kept simple rather than a JSON column since neither

@@ -46,25 +46,47 @@ class Settings(BaseSettings):
     # Expiry/max-attempts live in app/core/otp_store.py (in-memory, not DB
     # config) since they're not meant to be tuned per-deployment.
     otp_length: int = 6
-    # "dev" logs the OTP (and any Offers SMS) server-side instead of sending
-    # anything real — the safe default everywhere, including production
-    # until this is deliberately switched. "fast2sms" sends for real via
-    # Fast2SMSProvider (app/core/sms.py). Same switch covers both the OTP
-    # login flow and the Offers module's SMS channel — one flag, one
-    # provider class, no separate implementations.
+    # "dev" logs a WhatsApp send server-side instead of sending anything
+    # real; "meta" sends for real via MetaWhatsAppProvider (see
+    # app/core/sms.py/get_whatsapp_provider) using the META_WHATSAPP_* creds
+    # below. SMS support (Fast2SMS) was removed entirely — login OTP goes by
+    # email (app/core/email.py) and Offers/Credit Reminders are WhatsApp-only
+    # now. The name SMS_PROVIDER is a leftover from when this one flag
+    # covered both; not renamed since it's a deployed env var, not just an
+    # internal name — a follow-up cleanup, not done here.
     sms_provider: str = "dev"
 
-    # --- SMS (Fast2SMS) ---
-    # Fast2SMS's quick-send route ("q") works immediately with just an API
-    # key — no DLT template registration needed — which is why it's used for
-    # now. Lazy-validated like R2/SMTP above: only required once a send is
-    # actually attempted (see Fast2SMSProvider.send), so the app still boots
-    # fine with SMS_PROVIDER=dev and this unset.
-    fast2sms_api_key: str = ""
-    # Unused by the quick-send route today. Once a DLT-approved template is
-    # approved, the production route needs this (plus a template/message id)
-    # — kept here now so switching later is a config change, not a rewrite.
-    fast2sms_sender_id: str = ""
+    # --- WhatsApp (Meta Cloud API) ---
+    # Lazy-validated like R2/SMTP below: only required once a send is
+    # actually attempted (see MetaWhatsAppProvider.send), so the app still
+    # boots fine with SMS_PROVIDER=dev and these unset. ACCESS_TOKEN should
+    # be a permanent System User token for production — a temporary user
+    # token (the default when first testing in Meta's dashboard) expires
+    # in 24 hours. BUSINESS_ACCOUNT_ID isn't used by the send call itself
+    # (only PHONE_NUMBER_ID is) — kept for completeness/future use.
+    meta_whatsapp_access_token: str = ""
+    meta_whatsapp_phone_number_id: str = ""
+    meta_whatsapp_business_account_id: str = ""
+    # Meta's own copy of this exact string, pasted into its Webhooks setup
+    # (App Dashboard > WhatsApp > Configuration > Webhook > Verify token),
+    # is what proves an incoming GET on the webhook endpoint is really
+    # Meta's one-time subscription handshake and not anyone else hitting the
+    # URL — see app/controllers/whatsapp_webhook_controller.py.
+    meta_whatsapp_webhook_verify_token: str = ""
+    # Approved template names for outbound-initiated sends (Credit
+    # Reminders) — free-form text/document only works within a 24h window
+    # opened by the CUSTOMER messaging first (confirmed via real testing),
+    # so a cold outbound send has to use a pre-approved template instead.
+    # Both created via Meta's message_templates API — see git history for
+    # the exact submission — and are PENDING review as of this commit;
+    # confirm APPROVED status before relying on them. No Offers template
+    # yet: Offers' free-typed message doesn't fit WhatsApp's template model
+    # (a template that's just one big variable is a common rejection
+    # reason) — still sends via send_text/send_document within the 24h
+    # window only, pending a decision on fixed marketing template wording.
+    meta_whatsapp_reminder_template_name: str = "credit_reminder"
+    meta_whatsapp_reminder_with_bill_template_name: str = "credit_reminder_with_bill"
+    meta_whatsapp_template_language: str = "en_US"
 
     # --- File uploads ---
     # Local-disk storage (see app/main.py's StaticFiles mount) is now only a
@@ -88,6 +110,13 @@ class Settings(BaseSettings):
     r2_secret_access_key: str = ""
     r2_bucket_name: str = ""
 
+    # --- Email ---
+    # "smtp" (Gmail, below) is the long-standing default; "resend" sends via
+    # Resend's HTTP API instead (app/core/email.py's get_email_sender) — one
+    # flag, both implementations always present, same pattern as sms_provider
+    # above. Switching this doesn't remove or disable the other path.
+    email_provider: str = "smtp"
+
     # --- Email (SMTP) ---
     # Same lazy pattern as R2 above: no default for the credential fields,
     # left unset until real ones exist — only validated (in app/core/email.py)
@@ -101,6 +130,16 @@ class Settings(BaseSettings):
     smtp_username: str = ""
     smtp_app_password: str = ""
     smtp_from_name: str = "GM Fuel Station Audit"
+
+    # --- Email (Resend) ---
+    # Only required when EMAIL_PROVIDER=resend above; lazy-validated in
+    # app/core/email.py at send time, same as everything else in this
+    # section — the app boots fine with these unset otherwise.
+    # RESEND_FROM_EMAIL must be on a domain verified in the Resend dashboard
+    # (resend.com/domains) — an unverified sender domain is rejected by
+    # their API at send time, not at startup.
+    resend_api_key: str = ""
+    resend_from_email: str = ""
 
     @field_validator("secret_key")
     @classmethod

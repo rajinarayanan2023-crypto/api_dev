@@ -14,6 +14,7 @@ from app.controllers.offer_customer_controller import router as offer_customer_r
 from app.controllers.station_controller import router as station_router
 from app.controllers.upload_controller import router as upload_router
 from app.controllers.user_controller import router as user_router
+from app.controllers.whatsapp_webhook_controller import router as whatsapp_webhook_router
 
 api_router = APIRouter()
 api_router.include_router(auth_router)
@@ -30,3 +31,4 @@ api_router.include_router(offer_router)
 api_router.include_router(offer_customer_router)
 api_router.include_router(fuel_entry_router)
 api_router.include_router(upload_router)
+api_router.include_router(whatsapp_webhook_router)

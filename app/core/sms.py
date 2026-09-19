@@ -10,160 +10,263 @@ from app.core.exceptions import AppError
 logger = logging.getLogger("app.sms")
 settings = get_settings()
 
-# Fast2SMS's one bulkV2 endpoint serves both routes — "q" (quick, used here:
-# works immediately off just an API key, no DLT template needed) and "dlt"
-# (the production route, needs an approved template/message id + sender id).
-# Both are simple POSTs to the same URL with a different `route` value —
-# switching later is a config/payload change here, not a new endpoint.
-_FAST2SMS_URL = "https://www.fast2sms.com/dev/bulkV2"
-_FAST2SMS_TIMEOUT_SECONDS = 8.0  # fail fast rather than hang a login request
+# Meta deprecates old Graph API versions roughly every couple of years —
+# bump this if it starts returning a deprecation warning/error.
+_META_GRAPH_VERSION = "v26.0"
+_META_TIMEOUT_SECONDS = 15.0  # documents take a bit longer than plain text (Meta fetches the link server-side)
 
 
-def _mask(key: str) -> str:
-    """Never put a real API key in a log line — first/last 3 chars only."""
-    if len(key) <= 6:
+def _mask(token: str) -> str:
+    """Never put a real access token in a log line — first/last 4 chars only."""
+    if len(token) <= 8:
         return "***"
-    return f"{key[:3]}...{key[-3:]}"
+    return f"{token[:4]}...{token[-4:]}"
 
 
-def _digits_only(phone: str) -> str:
-    """Fast2SMS wants a bare 10-digit Indian mobile number — no +91/leading
-    0/spaces/dashes. Every phone number in this app is already stored that
-    way, but this strips anything else defensively rather than trusting it.
+def _to_e164(phone: str) -> str:
+    """Meta's docs explicitly recommend a leading '+' and full country code
+    on the "to" field — omitting '+' makes Meta prepend the BUSINESS
+    number's country code instead of the customer's, which can misdeliver
+    the message entirely, not just fail cleanly.
+
+    Every phone number in this app is stored as a bare 10-digit Indian
+    mobile number (see Offers.jsx/CreditBills.jsx's `^\\d{10}$` validation) —
+    mirrors the same digit-length heuristic already used by
+    BrandIcons.jsx's buildWhatsAppLink (which prepends "91" the same way,
+    just without the "+", since wa.me links don't want one).
     """
     digits = re.sub(r"\D", "", phone or "")
-    return digits[-10:] if len(digits) >= 10 else digits
+    if len(digits) == 10:
+        digits = f"91{digits}"
+    return f"+{digits}"
 
 
-class SmsSendError(AppError):
+class WhatsAppSendError(AppError):
     status_code = 502
-    detail = "Could not send the SMS — please try again."
-
-
-class SmsProvider(ABC):
-    @abstractmethod
-    async def send(self, to_phone: str | None, message: str) -> None: ...
-
-
-class DevLogSmsProvider(SmsProvider):
-    """No real SMS is sent — the message (OTP code included) is logged
-    server-side instead. The safe default everywhere (including production
-    until SMS_PROVIDER is deliberately switched to "fast2sms") so local dev
-    and testing never hits the real API or incurs real SMS cost.
-    """
-
-    async def send(self, to_phone: str | None, message: str) -> None:
-        logger.warning("DEV SMS to %s: %s", to_phone or "(no phone on file)", message)
-
-
-class Fast2SMSProvider(SmsProvider):
-    """Real SMS via Fast2SMS's quick-send route ("q") — works immediately
-    off just an API key, no DLT template registration needed. Once a
-    DLT-approved template is available, switch to it by changing `_route()`
-    /`_payload()` below to route="dlt" (+ FAST2SMS_SENDER_ID, + a template id
-    in place of the free-text message) — the send() signature and every
-    caller (OTP login, Offers SMS) stay exactly the same.
-
-    Raises SmsSendError (or AppError if unconfigured) rather than ever
-    returning a fake success — same contract as DevLogSmsProvider silently
-    succeeding, and the same "never swallow a real failure" rule email.py's
-    send_email follows. Callers already handle this: the Offers dispatch
-    loop (offer_service.py) catches it per-recipient and records "failed";
-    the OTP login route (auth_controller.py) catches it and reports a clean
-    error instead of claiming the code was sent.
-    """
-
-    def _payload(self, phone: str, message: str) -> dict:
-        # route="q": Fast2SMS's quick/transactional route. A DLT template id
-        # would replace `message` here and add `sender_id` once approved —
-        # everything else (auth, numbers, error handling) is unchanged.
-        return {
-            "route": "q",
-            "message": message,
-            "language": "english",
-            "flash": 0,
-            "numbers": _digits_only(phone),
-        }
-
-    async def send(self, to_phone: str | None, message: str) -> None:
-        if not settings.fast2sms_api_key:
-            raise AppError("SMS sending is not configured — set FAST2SMS_API_KEY to send real SMS.")
-        if not to_phone:
-            raise SmsSendError("No phone number on file for this recipient.")
-
-        numbers = _digits_only(to_phone)
-        if len(numbers) != 10:
-            raise SmsSendError(f"'{to_phone}' is not a valid 10-digit mobile number.")
-
-        headers = {"authorization": settings.fast2sms_api_key}
-        payload = self._payload(numbers, message)
-
-        try:
-            async with httpx.AsyncClient(timeout=_FAST2SMS_TIMEOUT_SECONDS) as client:
-                response = await client.post(_FAST2SMS_URL, data=payload, headers=headers)
-        except httpx.TimeoutException as exc:
-            logger.error("Fast2SMS request to %s timed out (key %s)", numbers, _mask(settings.fast2sms_api_key))
-            raise SmsSendError("SMS provider timed out — please try again.") from exc
-        except httpx.HTTPError as exc:
-            logger.error("Fast2SMS request to %s failed: %s", numbers, exc)
-            raise SmsSendError(f"Could not reach the SMS provider: {exc}") from exc
-
-        # Fast2SMS returns HTTP 200 for most logical failures too (bad key,
-        # bad number, low balance, ...) — the real signal is the `return`
-        # field in the JSON body, not the status code. Still guard the
-        # status code separately since an auth failure at the HTTP layer
-        # (e.g. a malformed key) isn't guaranteed to come back as JSON.
-        try:
-            body = response.json()
-        except ValueError:
-            body = None
-
-        ok = isinstance(body, dict) and body.get("return") is True
-        if response.status_code != 200 or not ok:
-            reason = (body or {}).get("message") if isinstance(body, dict) else response.text
-            logger.error(
-                "Fast2SMS send to %s failed (status %s, key %s): %s",
-                numbers,
-                response.status_code,
-                _mask(settings.fast2sms_api_key),
-                reason,
-            )
-            raise SmsSendError(f"SMS provider rejected the message: {reason}")
-
-        logger.info("Fast2SMS send to %s ok — request_id=%s", numbers, body.get("request_id"))
-
-
-def get_sms_provider() -> SmsProvider:
-    if settings.sms_provider == "dev":
-        return DevLogSmsProvider()
-    if settings.sms_provider == "fast2sms":
-        return Fast2SMSProvider()
-    raise NotImplementedError(
-        f"No SmsProvider implemented for SMS_PROVIDER={settings.sms_provider!r} yet — "
-        "add one to app/core/sms.py."
-    )
+    detail = "Could not send the WhatsApp message — please try again."
 
 
 class WhatsAppProvider(ABC):
     @abstractmethod
     async def send(self, to_phone: str | None, message: str) -> None: ...
 
+    # Alias for send() — same thing, named to read clearly next to
+    # send_document() below at call sites that send either kind.
+    async def send_text(self, to_phone: str | None, message: str) -> None:
+        await self.send(to_phone, message)
+
+    @abstractmethod
+    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> None: ...
+
+    # send/send_document above only work within WhatsApp's 24h customer-
+    # initiated window — confirmed via real testing (Meta accepts the
+    # request, 200 OK, but never actually delivers it outside that window).
+    # This is the one that can cold-message a customer who hasn't messaged
+    # first, which is the actual Offers/Credit Reminder use case — but only
+    # for a name+language Meta has pre-approved (see message_templates).
+    @abstractmethod
+    async def send_template(
+        self,
+        to_phone: str | None,
+        template_name: str,
+        language_code: str,
+        variables: list[str],
+        document_url: str | None = None,
+        document_filename: str | None = None,
+    ) -> None: ...
+
 
 class DevLogWhatsAppProvider(WhatsAppProvider):
-    """Same stand-in as DevLogSmsProvider above — no WhatsApp Business API
-    account exists yet, so this just logs. Offer sends used to open a wa.me
-    deep link client-side instead of a real send; that only works for one
-    recipient at a time, which doesn't fit a bulk send with per-recipient
-    tracking, so it's replaced by this (also-not-real-yet) server-side path.
+    """No real WhatsApp Business API call is made — the message (and, for a
+    document send, the file URL) is logged server-side instead. The safe
+    default everywhere (including production until SMS_PROVIDER is
+    deliberately switched to "meta") so local dev and testing never hits
+    the real API or sends a real message to a real customer.
     """
 
     async def send(self, to_phone: str | None, message: str) -> None:
         logger.warning("DEV WhatsApp to %s: %s", to_phone or "(no phone on file)", message)
 
+    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> None:
+        logger.warning(
+            "DEV WhatsApp document to %s: %s (file: %s, %s)",
+            to_phone or "(no phone on file)",
+            message,
+            filename,
+            document_url,
+        )
+
+    async def send_template(
+        self,
+        to_phone: str | None,
+        template_name: str,
+        language_code: str,
+        variables: list[str],
+        document_url: str | None = None,
+        document_filename: str | None = None,
+    ) -> None:
+        logger.warning(
+            "DEV WhatsApp template to %s: %s (%s) vars=%s doc=%s",
+            to_phone or "(no phone on file)",
+            template_name,
+            language_code,
+            variables,
+            document_url,
+        )
+
+
+class MetaWhatsAppProvider(WhatsAppProvider):
+    """Real WhatsApp send via Meta's Cloud API — POST /{PHONE_NUMBER_ID}/messages,
+    Bearer auth, one call per message (text, document, or template).
+
+    Raises WhatsAppSendError (or AppError if unconfigured) rather than ever
+    returning a fake success — same contract as Fast2SMSProvider used to
+    follow (see git history) and send_email still does. Callers already
+    handle this: the Offers dispatch loop (offer_service.py) catches it
+    per-recipient and records "failed"; the Credit Reminder endpoint lets it
+    propagate as a clean AppError response instead of claiming the reminder
+    was sent.
+
+    Document sends use Meta's `document.link` field (a plain HTTPS URL)
+    rather than pre-uploading to Meta's own /media endpoint first — verified
+    against Meta's current docs: the document object accepts either `id`
+    (pre-uploaded media) or `link` (an externally-hosted URL) directly.
+    Meta's own docs note `id` performs slightly better, but `link` needs no
+    upload step at all, which is what actually keeps this simple — an R2
+    presigned URL fed straight to `link` works as-is.
+    """
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {settings.meta_whatsapp_access_token}"}
+
+    def _url(self) -> str:
+        return f"https://graph.facebook.com/{_META_GRAPH_VERSION}/{settings.meta_whatsapp_phone_number_id}/messages"
+
+    def _check_configured(self) -> None:
+        if not settings.meta_whatsapp_access_token or not settings.meta_whatsapp_phone_number_id:
+            raise AppError(
+                "WhatsApp sending is not configured — set META_WHATSAPP_ACCESS_TOKEN and "
+                "META_WHATSAPP_PHONE_NUMBER_ID to send real WhatsApp messages."
+            )
+
+    async def _post(self, payload: dict, to_phone: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=_META_TIMEOUT_SECONDS) as client:
+                response = await client.post(self._url(), json=payload, headers=self._headers())
+        except httpx.TimeoutException as exc:
+            logger.error("Meta WhatsApp request to %s timed out (token %s)", to_phone, _mask(settings.meta_whatsapp_access_token))
+            raise WhatsAppSendError("WhatsApp provider timed out — please try again.") from exc
+        except httpx.HTTPError as exc:
+            logger.error("Meta WhatsApp request to %s failed: %s", to_phone, exc)
+            raise WhatsAppSendError(f"Could not reach the WhatsApp provider: {exc}") from exc
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+
+        if response.status_code != 200:
+            # Meta's error shape: {"error": {"message": ..., "type": ...,
+            # "code": ..., "error_subcode": ..., "fbtrace_id": ...}}. Covers
+            # every realistic failure explicitly: an expired/invalid token
+            # and a bad/unregistered recipient both come back as a 400/401
+            # with a message here — never a silent success either way.
+            error = (body or {}).get("error") if isinstance(body, dict) else None
+            reason = error.get("message") if isinstance(error, dict) else response.text
+            code = error.get("code") if isinstance(error, dict) else None
+            logger.error(
+                "Meta WhatsApp send to %s failed (status %s, code %s, token %s): %s",
+                to_phone,
+                response.status_code,
+                code,
+                _mask(settings.meta_whatsapp_access_token),
+                reason,
+            )
+            raise WhatsAppSendError(f"WhatsApp provider rejected the message: {reason}")
+
+        message_id = None
+        if isinstance(body, dict):
+            messages = body.get("messages") or []
+            message_id = messages[0].get("id") if messages else None
+        logger.info("Meta WhatsApp send to %s ok — message_id=%s", to_phone, message_id)
+
+    async def send(self, to_phone: str | None, message: str) -> None:
+        self._check_configured()
+        if not to_phone:
+            raise WhatsAppSendError("No phone number on file for this recipient.")
+        formatted = _to_e164(to_phone)
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": formatted,
+            "type": "text",
+            "text": {"body": message},
+        }
+        await self._post(payload, formatted)
+
+    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> None:
+        self._check_configured()
+        if not to_phone:
+            raise WhatsAppSendError("No phone number on file for this recipient.")
+        formatted = _to_e164(to_phone)
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": formatted,
+            "type": "document",
+            "document": {"link": document_url, "filename": filename, "caption": message},
+        }
+        await self._post(payload, formatted)
+
+    async def send_template(
+        self,
+        to_phone: str | None,
+        template_name: str,
+        language_code: str,
+        variables: list[str],
+        document_url: str | None = None,
+        document_filename: str | None = None,
+    ) -> None:
+        self._check_configured()
+        if not to_phone:
+            raise WhatsAppSendError("No phone number on file for this recipient.")
+        formatted = _to_e164(to_phone)
+
+        components = []
+        if document_url:
+            # A template whose HEADER component is type=document requires a
+            # document parameter on every send using it — there's no way to
+            # define one "optional" header on a single template, which is
+            # exactly why credit_reminder / credit_reminder_with_bill are
+            # two separate templates rather than one with a sometimes-empty
+            # header (see CreditCustomerService.send_reminder).
+            components.append({
+                "type": "header",
+                "parameters": [
+                    {"type": "document", "document": {"link": document_url, "filename": document_filename or "document.pdf"}}
+                ],
+            })
+        if variables:
+            # Positional {{1}}, {{2}}, ... — order here must match the
+            # order the template's own body text references them in.
+            components.append({"type": "body", "parameters": [{"type": "text", "text": v} for v in variables]})
+
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": formatted,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language_code},
+                "components": components,
+            },
+        }
+        await self._post(payload, formatted)
+
 
 def get_whatsapp_provider() -> WhatsAppProvider:
     if settings.sms_provider == "dev":
         return DevLogWhatsAppProvider()
+    if settings.sms_provider == "meta":
+        return MetaWhatsAppProvider()
     raise NotImplementedError(
         f"No WhatsAppProvider implemented for SMS_PROVIDER={settings.sms_provider!r} yet — "
         "add one to app/core/sms.py."

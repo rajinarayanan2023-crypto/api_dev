@@ -1,0 +1,68 @@
+name: Migrate schema (Neon US -> Singapore)
+
+# One-off maintenance workflow: dumps the schema (no data) from the source
+# Neon database and restores it into the target. Runs on GitHub's own Linux
+# runner so it isn't subject to any local machine's Application Control
+# policy, and installs the exact PostgreSQL 18 client tools needed to talk
+# to a PostgreSQL 18 server (an older pg_dump refuses to dump a newer major
+# version server outright).
+#
+# Requires two repository secrets, added via
+# Settings -> Secrets and variables -> Actions -> New repository secret:
+#   NEON_SOURCE_URL - the current (source) database's connection string
+#   NEON_TARGET_URL - the new Singapore database's connection string
+#     (use the DIRECT, non-pooler host, not the "-pooler" one — Neon's
+#     pooler doesn't reliably preserve session state like search_path
+#     across the many statements a schema restore issues)
+#
+# Trigger manually from the Actions tab (this repo -> Actions ->
+# "Migrate schema (Neon US -> Singapore)" -> Run workflow). Safe to re-run;
+# each run's schema dump is also kept as a downloadable artifact for 7 days.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  migrate-schema:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PostgreSQL 18 client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates gnupg lsb-release
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-18
+
+      - name: Dump schema (no data) from source
+        env:
+          SOURCE_URL: ${{ secrets.NEON_SOURCE_URL }}
+        run: |
+          pg_dump --schema-only --no-owner --no-privileges --no-comments \
+            "$SOURCE_URL" -f schema_only.sql
+          echo "Dump size:"
+          wc -l schema_only.sql
+
+      - name: Restore schema into target (Singapore)
+        env:
+          TARGET_URL: ${{ secrets.NEON_TARGET_URL }}
+        run: |
+          psql "$TARGET_URL" -f schema_only.sql
+
+      - name: Verify table count matches
+        env:
+          SOURCE_URL: ${{ secrets.NEON_SOURCE_URL }}
+          TARGET_URL: ${{ secrets.NEON_TARGET_URL }}
+        run: |
+          echo "Source tables:"
+          psql "$SOURCE_URL" -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+          echo "Target tables:"
+          psql "$TARGET_URL" -t -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';"
+
+      - name: Upload schema dump as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-only-dump
+          path: schema_only.sql
+          retention-days: 7

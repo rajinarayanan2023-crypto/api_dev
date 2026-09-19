@@ -102,18 +102,13 @@ def _otp_email_html(otp: str, expiry_phrase: str) -> str:
 """
 
 
-# TESTING BYPASS — response_model temporarily changed from LoginOtpResponse
-# to VerifyOtpResponse while the OTP email step below is disabled (Railway
-# blocks outbound SMTP ports in production). To revert: change this back to
-# response_model=LoginOtpResponse and restore the `-> LoginOtpResponse`
-# return type below.
-@router.post("/login", response_model=VerifyOtpResponse)
+@router.post("/login", response_model=LoginOtpResponse)
 @limiter.limit(settings.rate_limit_login)
 async def login(
     request: Request,
     credentials: LoginRequest,
     session: AsyncSession = Depends(get_db_session),
-) -> VerifyOtpResponse:
+) -> LoginOtpResponse:
     # Single query: identifier is matched against email OR name (see
     # UserRepository.get_by_identifier) — no separate lookups.
     user = await UserRepository(session).get_by_identifier(credentials.identifier)
@@ -135,41 +130,23 @@ async def login(
     if not verify_password(credentials.password, user.password_hash):
         raise invalid_credentials
 
-    # ------------------------------------------------------------------
-    # TESTING BYPASS — OTP-by-email temporarily disabled (Railway blocks
-    # outbound SMTP ports, so send_email() throws OSError in production).
-    # Issuing real tokens straight away instead of emailing an OTP, so a
-    # correct password alone logs the user in.
-    #
-    # To revert: delete this block, uncomment the ORIGINAL block below,
-    # and restore response_model=LoginOtpResponse / -> LoginOtpResponse
-    # above.
-    # ------------------------------------------------------------------
-    user.last_login_at = datetime.now(timezone.utc)
-    await session.flush()
-    tokens = await AuthService(session).issue_tokens(user)
-    return VerifyOtpResponse(
-        **tokens.model_dump(),
-        user=AuthUser(id=str(user.id), name=user.name, email=user.email, role=user.role),
+    # OTP goes to the user's registered email, not SMS/phone — SMS has since
+    # been removed from the app entirely (Offers is WhatsApp-only now too,
+    # see offer_service.py). from_name overrides the sender display name
+    # just for this email — audit report emails keep the default
+    # settings.smtp_from_name. send_email() itself picks Gmail SMTP or
+    # Resend per EMAIL_PROVIDER (see app/core/email.py) — this call site
+    # doesn't need to know or care which.
+    otp = generate_otp(str(user.id))
+    expiry = otp_expiry_phrase()
+    send_email(
+        user.email,
+        "Welcome to the GM Agency App - Your OTP code",
+        _otp_email_text(otp, expiry),
+        html_body=_otp_email_html(otp, expiry),
+        from_name="GM Agency App OTP",
     )
-
-    # ---------------- ORIGINAL (OTP-via-email) — commented out for testing ----------------
-    # otp = generate_otp(str(user.id))
-    # # OTP now goes to the user's registered email, not SMS — a real SMS send
-    # # costs money per login (see app/core/sms.py/Fast2SMSProvider, still used
-    # # by the Offers module), while email is free via the existing SMTP setup.
-    # # This is a login-only change: Offers' SMS channel is untouched. from_name
-    # # overrides the sender display name just for this email — audit report
-    # # emails keep the default settings.smtp_from_name.
-    # expiry = otp_expiry_phrase()
-    # send_email(
-    #     user.email,
-    #     "Welcome to the GM Agency App - Your OTP code",
-    #     _otp_email_text(otp, expiry),
-    #     html_body=_otp_email_html(otp, expiry),
-    #     from_name="GM Agency App OTP",
-    # )
-    # return LoginOtpResponse(message="OTP sent.", user_id=str(user.id))
+    return LoginOtpResponse(message="OTP sent.", user_id=str(user.id))
 
 
 @router.post("/verify-otp", response_model=VerifyOtpResponse)

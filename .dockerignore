@@ -1,0 +1,12 @@
+.venv-win
+.venv
+__pycache__
+*.pyc
+.env
+.env.example
+.git
+.github
+node_modules
+uploads
+*.log
+.pytest_cache

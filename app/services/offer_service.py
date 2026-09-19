@@ -3,13 +3,30 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NotFoundError
-from app.core.sms import get_sms_provider, get_whatsapp_provider
+from app.core.exceptions import AppError, NotFoundError
+from app.core.sms import get_whatsapp_provider
 from app.models.offer import OfferCustomer, OfferSend, OfferSendRecipient
 from app.models.user import User
 from app.repositories.offer_repository import OfferSendRepository
 from app.schemas.offer import OfferSendCreate
 from app.services.audit import attach_actor_names
+from app.services.station_service import StationService
+
+# The fixed set of approved Meta WhatsApp templates Offers can send —
+# submitted via the message_templates API (see git history for the exact
+# request), one entry per canned option the UI offers. Keyed by the same id
+# Offers.jsx already used for its old client-side-only quick-reply presets,
+# so the frontend's existing selector wires straight into this. Each
+# template's body has exactly one slot, {{2}}, for whatever offer-specific
+# value varies per send (a discount, a litre threshold, a cashback %) —
+# {{1}} is always the station name. Confirm APPROVED status in Meta's
+# dashboard before relying on these; all four were PENDING as of this commit.
+OFFER_TEMPLATES: dict[str, dict[str, str]] = {
+    "tamil-bulk-1": {"name": "offer_tamil_bulk_short", "language": "ta", "label": "Tamil · Bulk Offer (Short)"},
+    "tamil-bulk-2": {"name": "offer_tamil_bulk_detailed", "language": "ta", "label": "Tamil · Bulk Offer (Detailed)"},
+    "english-bulk": {"name": "offer_english_bulk", "language": "en", "label": "English · Bulk Offer"},
+    "loyalty-credit": {"name": "offer_loyalty_credit_reminder", "language": "en", "label": "English · Loyalty / Credit Reminder"},
+}
 
 
 def _attach_status_counts(sends: list[OfferSend]) -> None:
@@ -26,6 +43,10 @@ class OfferService:
         self.sends = OfferSendRepository(session)
 
     async def send(self, data: OfferSendCreate, actor: User) -> OfferSend:
+        template = OFFER_TEMPLATES.get(data.template_used)
+        if template is None:
+            raise AppError(f"Unknown offer template: {data.template_used!r}")
+
         # De-duplicated (preserving order) — offer_customers has no unique
         # constraint tying a send to a customer any more (see
         # OfferSendRecipient's docstring), so a request naming the same id
@@ -41,11 +62,19 @@ class OfferService:
         if missing:
             raise NotFoundError("One or more selected customers no longer exist.")
 
-        provider = get_sms_provider() if data.channel == "sms" else get_whatsapp_provider()
+        provider = get_whatsapp_provider()
+        station = await StationService(self.session).get_station()
+        # Not what's actually delivered (that's the template's own approved
+        # wording, filled in via send_template below) — just a readable
+        # summary for the "Recently Sent" history view/DB row, which still
+        # requires some non-empty `message` text.
+        preview_message = f"{template['label']} — {data.offer_variable}"
 
         send = OfferSend(
-            message=data.message,
-            channel=data.channel,
+            message=preview_message,
+            # SMS was removed as a channel — every new send is WhatsApp now.
+            # Historical rows can still be "sms"; this never rewrites those.
+            channel="whatsapp",
             template_used=data.template_used,
             created_by=actor.id,
             updated_by=actor.id,
@@ -53,16 +82,25 @@ class OfferService:
         recipients = []
         for customer_id in customer_ids:
             name, phone = found[customer_id]
-            # Snapshot the name now — this row never looks the customer up
-            # again, so it reads the same after the customer is renamed or
-            # deleted (see OfferSendRecipient's docstring).
-            recipient = OfferSendRecipient(customer_name=name)
+            # Snapshot the name/phone now — this row never looks the customer
+            # up again, so it reads the same after the customer is renamed,
+            # has its number changed, or is deleted (see OfferSendRecipient's
+            # docstring).
+            recipient = OfferSendRecipient(customer_name=name, customer_phone=phone)
             if not phone:
                 recipient.status = "blocked"
                 recipient.provider_response = "No phone number on file."
             else:
                 try:
-                    await provider.send(phone, data.message)
+                    # send_text (free-form) can't reach a customer who
+                    # hasn't messaged first, within 24h — confirmed via real
+                    # testing — so this always goes out as the approved
+                    # template. {{1}} station name, {{2}} the one
+                    # offer-specific value, matching the order OFFER_TEMPLATES'
+                    # own submitted body text references them in.
+                    await provider.send_template(
+                        phone, template["name"], template["language"], [station.name, data.offer_variable]
+                    )
                     recipient.status = "sent"
                     recipient.sent_at = datetime.now(timezone.utc)
                 except Exception as exc:  # noqa: BLE001 — recorded per-recipient, not raised
