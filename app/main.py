@@ -85,6 +85,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
+    # "Date" isn't on the fetch spec's CORS-safelisted response headers, so a
+    # cross-origin fetch() can't read it via res.headers.get('Date') unless
+    # explicitly exposed here — the frontend uses it to learn the server's
+    # clock (see apiClient.js/serverTime.js), so "today" is never wrong just
+    # because one device's own clock/timezone is misconfigured.
+    expose_headers=["Date"],
 )
 
 app.add_middleware(SecurityHeadersMiddleware, strict_transport=settings.environment == "production")

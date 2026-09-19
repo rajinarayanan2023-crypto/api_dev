@@ -201,20 +201,19 @@ class CreditCustomerService:
         if bill_key:
             delete_object(bill_key)
 
-    async def send_reminder(self, customer_id: uuid.UUID) -> None:
-        """Sends a one-off WhatsApp reminder for this customer's outstanding
-        balance, with their most recent bill attached if one exists.
+    async def _send_credit_reminder_template(
+        self, customer: CreditCustomer, bill_file_url: str | None, bill_file_name: str | None
+    ) -> None:
+        """Shared by send_reminder (most-recent-bill-overall) and
+        send_ledger_entry_reminder (this-one-transaction's-bill) below — both
+        ultimately send the exact same two approved templates, just with a
+        different bill (or none) picked out ahead of this call.
 
-        Not persisted anywhere (no history row, unlike Offers' OfferSend) —
-        this is a single ad hoc nudge, not a tracked campaign. Raises
-        cleanly (NotFoundError, or whatever the WhatsApp provider raises —
-        see core/sms.py) rather than ever reporting a fake success; the
-        controller lets that propagate as-is, same as every other AppError
-        in this app.
+        Raises cleanly (NotFoundError, ConflictError, or whatever the
+        WhatsApp provider raises — see core/sms.py) rather than ever
+        reporting a fake success; the controller lets that propagate as-is,
+        same as every other AppError in this app.
         """
-        customer = await self.customers.get_with_details(customer_id)
-        if customer is None:
-            raise NotFoundError("Credit customer not found.")
         if not customer.phone:
             raise ConflictError("This customer has no phone number on file.")
 
@@ -225,8 +224,46 @@ class CreditCustomerService:
         # body text references (see the templates submitted via Meta's
         # message_templates API — git history has the exact request). Bare
         # number, no ₹ — the template's own fixed text already has "Rs."
-        # baked in ahead of {{3}}.
+        # baked in ahead of {{3}}. Always the customer's overall outstanding
+        # balance (matching the template's own wording) — never just this
+        # one transaction's amount, even when the attached bill is scoped to
+        # one specific transaction (see send_ledger_entry_reminder).
         variables = [customer.name, station.name, f"{balance:,.2f}"]
+
+        provider = get_whatsapp_provider()
+        # send_text/send_document only deliver within a 24h window the
+        # CUSTOMER opened by messaging first (confirmed via real testing) —
+        # send_template is the one that can reach a customer cold, which is
+        # the actual point of a reminder, so this always goes out as a
+        # template, never as free-form text.
+        if bill_file_url:
+            document_url = get_download_presigned_url(bill_file_url)
+            await provider.send_template(
+                customer.phone,
+                settings.meta_whatsapp_reminder_with_bill_template_name,
+                settings.meta_whatsapp_template_language,
+                variables,
+                document_url=document_url,
+                document_filename=bill_file_name or "bill",
+            )
+        else:
+            await provider.send_template(
+                customer.phone,
+                settings.meta_whatsapp_reminder_template_name,
+                settings.meta_whatsapp_template_language,
+                variables,
+            )
+
+    async def send_reminder(self, customer_id: uuid.UUID) -> None:
+        """Sends a one-off WhatsApp reminder for this customer's outstanding
+        balance, with their most recent bill attached if one exists.
+
+        Not persisted anywhere (no history row, unlike Offers' OfferSend) —
+        this is a single ad hoc nudge, not a tracked campaign.
+        """
+        customer = await self.customers.get_with_details(customer_id)
+        if customer is None:
+            raise NotFoundError("Credit customer not found.")
 
         # "Most recent bill" spans two different places a bill can live —
         # the customer's general Bills & Documents (CreditCustomerBill) and
@@ -240,27 +277,21 @@ class CreditCustomerService:
             if e.bill_file_url and (latest_bill is None or e.date > latest_bill[0]):
                 latest_bill = (e.date, e.bill_file_url, e.bill_file_name or "bill")
 
-        provider = get_whatsapp_provider()
-        # send_text/send_document only deliver within a 24h window the
-        # CUSTOMER opened by messaging first (confirmed via real testing) —
-        # send_template is the one that can reach a customer cold, which is
-        # the actual point of a reminder, so this always goes out as a
-        # template, never as free-form text.
-        if latest_bill is not None:
-            _, file_url, file_name = latest_bill
-            document_url = get_download_presigned_url(file_url)
-            await provider.send_template(
-                customer.phone,
-                settings.meta_whatsapp_reminder_with_bill_template_name,
-                settings.meta_whatsapp_template_language,
-                variables,
-                document_url=document_url,
-                document_filename=file_name,
-            )
-        else:
-            await provider.send_template(
-                customer.phone,
-                settings.meta_whatsapp_reminder_template_name,
-                settings.meta_whatsapp_template_language,
-                variables,
-            )
+        file_url, file_name = (latest_bill[1], latest_bill[2]) if latest_bill else (None, None)
+        await self._send_credit_reminder_template(customer, file_url, file_name)
+
+    async def send_ledger_entry_reminder(self, customer_id: uuid.UUID, entry_id: uuid.UUID) -> None:
+        """Same reminder as send_reminder above, but the attachment (if any)
+        is always THIS ONE transaction row's own bill — never "most recent
+        overall" — since the whole point of attaching a bill per-row is that
+        different entries can be at different stages (see the WhatsApp
+        button next to each Transaction History row).
+        """
+        customer = await self.customers.get_with_details(customer_id)
+        if customer is None:
+            raise NotFoundError("Credit customer not found.")
+        entry = next((e for e in customer.ledger_entries if e.id == entry_id), None)
+        if entry is None:
+            raise NotFoundError("Ledger entry not found.")
+
+        await self._send_credit_reminder_template(customer, entry.bill_file_url, entry.bill_file_name)

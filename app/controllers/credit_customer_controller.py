@@ -119,3 +119,15 @@ async def send_credit_reminder(
     service = CreditCustomerService(session)
     await service.send_reminder(customer_id)
     return Message(detail="Reminder sent.")
+
+
+@router.post("/{customer_id}/ledger/{entry_id}/send-reminder", response_model=Message)
+async def send_ledger_entry_reminder(
+    customer_id: uuid.UUID,
+    entry_id: uuid.UUID,
+    current_user: User = Depends(get_current_active_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> Message:
+    service = CreditCustomerService(session)
+    await service.send_ledger_entry_reminder(customer_id, entry_id)
+    return Message(detail="Reminder sent.")

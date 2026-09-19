@@ -23,13 +23,18 @@ class LubricantService:
         product = LubricantProduct(**payload, stock=data.opening_stock, created_by=actor.id, updated_by=actor.id)
         today = date.today()
         product.price_history = [LubricantPriceHistory(effective_from=today, rate=data.opening_rate)]
-        # Opening stock is itself the product's first purchase (cost 0) —
-        # mirrors the old mock data's addLubricant, and keeps
-        # stockAvailableAtRate's per-price-period counting correct from day
-        # one, once the price is ever revised.
+        # Opening stock is itself the product's first purchase — recorded
+        # against the rate just entered (the only price this form actually
+        # collects), rather than a hardcoded 0, which showed as an obviously
+        # wrong "₹0/unit" in Purchase History for stock the manager had just
+        # priced. Not a true acquisition cost (there's no separate "what did
+        # you pay for the opening stock" field), but it's the only real
+        # figure available here and is far closer to correct than 0 — and it
+        # keeps stockAvailableAtRate's per-price-period counting correct from
+        # day one, once the price is ever revised, same as before.
         if data.opening_stock > 0:
             product.purchase_history = [
-                LubricantPurchaseHistory(date=today, qty=data.opening_stock, cost=0)
+                LubricantPurchaseHistory(date=today, qty=data.opening_stock, cost=data.opening_rate)
             ]
         created = await self.products.create(product)
         # BaseRepository.create()'s refresh() expires (but does not eagerly
