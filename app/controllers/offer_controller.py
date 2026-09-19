@@ -3,10 +3,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_user, get_db_session, require_manager_or_admin
 from app.models.user import User
-from app.schemas.offer import OfferSendCreate, OfferSendOut
+from app.schemas.offer import OfferSendCreate, OfferSendOut, OfferTemplatePreviewOut
 from app.services.offer_service import OfferService
 
 router = APIRouter(prefix="/offers", tags=["offers"], dependencies=[Depends(get_current_active_user)])
+
+
+@router.get("/templates/{template_id}/preview", response_model=OfferTemplatePreviewOut)
+async def preview_offer_template(
+    template_id: str,
+    offer_variable: str = Query(default=""),
+    session: AsyncSession = Depends(get_db_session),
+) -> OfferTemplatePreviewOut:
+    service = OfferService(session)
+    preview = await service.preview_template(template_id, offer_variable)
+    return OfferTemplatePreviewOut.model_validate(preview)
 
 
 @router.post("/send", response_model=OfferSendOut, status_code=status.HTTP_201_CREATED)

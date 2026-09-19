@@ -29,6 +29,18 @@ class OfferSendCreate(BaseModel):
     offer_variable: str = Field(min_length=1, max_length=100)
 
 
+class OfferTemplatePreviewOut(BaseModel):
+    # Meta's own review status for this template ("APPROVED", "PENDING",
+    # "REJECTED", ...) — surfaced so the UI can warn if someone's about to
+    # send a template that isn't actually approved yet.
+    status: str
+    header_format: str | None = None
+    # The real approved body text with {{1}}/{{2}} already substituted —
+    # fetched live from Meta (see MetaWhatsAppProvider.get_template_info),
+    # never a hand-copied guess that could drift from what's actually live.
+    preview_text: str
+
+
 class OfferSendRecipientOut(ORMModel):
     customer_name: str
     customer_phone: str | None = None

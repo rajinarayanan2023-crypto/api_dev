@@ -75,6 +75,14 @@ class WhatsAppProvider(ABC):
         document_filename: str | None = None,
     ) -> None: ...
 
+    # Fetches the template's real approved body text + review status
+    # straight from Meta, rather than keeping a second, hand-copied version
+    # of the wording in this codebase that could silently drift from
+    # whatever is actually live there. Only MetaWhatsAppProvider can do this
+    # for real; DevLogWhatsAppProvider returns a clearly-labeled stand-in.
+    @abstractmethod
+    async def get_template_info(self, template_name: str, language_code: str) -> dict: ...
+
 
 class DevLogWhatsAppProvider(WhatsAppProvider):
     """No real WhatsApp Business API call is made — the message (and, for a
@@ -113,6 +121,13 @@ class DevLogWhatsAppProvider(WhatsAppProvider):
             variables,
             document_url,
         )
+
+    async def get_template_info(self, template_name: str, language_code: str) -> dict:
+        return {
+            "status": "DEV",
+            "header_format": None,
+            "body_text": f"[DEV MODE — no real Meta template fetched for {template_name} ({language_code})]",
+        }
 
 
 class MetaWhatsAppProvider(WhatsAppProvider):
@@ -260,6 +275,45 @@ class MetaWhatsAppProvider(WhatsAppProvider):
             },
         }
         await self._post(payload, formatted)
+
+    async def get_template_info(self, template_name: str, language_code: str) -> dict:
+        self._check_configured()
+        if not settings.meta_whatsapp_business_account_id:
+            raise AppError(
+                "WhatsApp sending is not configured — set META_WHATSAPP_BUSINESS_ACCOUNT_ID to preview templates."
+            )
+        url = f"https://graph.facebook.com/{_META_GRAPH_VERSION}/{settings.meta_whatsapp_business_account_id}/message_templates"
+        params = {"name": template_name, "fields": "name,language,status,components"}
+        try:
+            async with httpx.AsyncClient(timeout=_META_TIMEOUT_SECONDS) as client:
+                response = await client.get(url, params=params, headers=self._headers())
+        except httpx.HTTPError as exc:
+            logger.error("Meta template lookup for %s failed: %s", template_name, exc)
+            raise WhatsAppSendError(f"Could not reach the WhatsApp provider: {exc}") from exc
+
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+
+        if response.status_code != 200:
+            error = (body or {}).get("error") if isinstance(body, dict) else None
+            reason = error.get("message") if isinstance(error, dict) else response.text
+            raise WhatsAppSendError(f"WhatsApp provider rejected the template lookup: {reason}")
+
+        candidates = (body or {}).get("data") or []
+        match = next((c for c in candidates if c.get("language") == language_code), None)
+        if match is None:
+            raise AppError(f"Template {template_name!r} ({language_code}) was not found on Meta.")
+
+        components = match.get("components") or []
+        body_component = next((c for c in components if c.get("type") == "BODY"), None)
+        header_component = next((c for c in components if c.get("type") == "HEADER"), None)
+        return {
+            "status": match.get("status", "UNKNOWN"),
+            "header_format": header_component.get("format") if header_component else None,
+            "body_text": body_component.get("text", "") if body_component else "",
+        }
 
 
 def get_whatsapp_provider() -> WhatsAppProvider:

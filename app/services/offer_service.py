@@ -119,6 +119,26 @@ class OfferService:
         _attach_status_counts([full])
         return full
 
+    async def preview_template(self, template_used: str, offer_variable: str) -> dict:
+        template = OFFER_TEMPLATES.get(template_used)
+        if template is None:
+            raise AppError(f"Unknown offer template: {template_used!r}")
+
+        provider = get_whatsapp_provider()
+        station = await StationService(self.session).get_station()
+        info = await provider.get_template_info(template["name"], template["language"])
+
+        # {{1}} is always the station name, {{2}} the one offer-specific
+        # value — same positional order send() fills in for a real send
+        # (see the send_template call above), so the preview always matches
+        # exactly what the customer will receive.
+        preview_text = info["body_text"].replace("{{1}}", station.name).replace("{{2}}", offer_variable or "…")
+        return {
+            "status": info["status"],
+            "header_format": info["header_format"],
+            "preview_text": preview_text,
+        }
+
     async def list_history(self, offset: int = 0, limit: int = 100) -> list[OfferSend]:
         sends = await self.sends.list_with_recipients(offset=offset, limit=limit)
         await attach_actor_names(self.session, sends)
