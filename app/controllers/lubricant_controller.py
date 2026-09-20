@@ -75,6 +75,18 @@ async def add_price_revision(
     return LubricantOut.model_validate(product)
 
 
+@router.delete("/{product_id}/price-history/{revision_id}", response_model=LubricantOut)
+async def delete_price_revision(
+    product_id: uuid.UUID,
+    revision_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_manager_or_admin),
+) -> LubricantOut:
+    service = LubricantService(session)
+    product = await service.delete_price_revision(product_id, revision_id, current_user)
+    return LubricantOut.model_validate(product)
+
+
 @router.post("/{product_id}/purchases", response_model=LubricantOut)
 async def add_purchase(
     product_id: uuid.UUID,

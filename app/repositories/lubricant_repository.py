@@ -42,6 +42,10 @@ class LubricantRepository(BaseRepository[LubricantProduct]):
         await self.session.refresh(revision)
         return revision
 
+    async def delete_price_revision(self, revision: LubricantPriceHistory) -> None:
+        await self.session.delete(revision)
+        await self.session.flush()
+
     async def add_purchase(self, purchase: LubricantPurchaseHistory) -> LubricantPurchaseHistory:
         self.session.add(purchase)
         await self.session.flush()
@@ -59,6 +63,26 @@ class LubricantRepository(BaseRepository[LubricantProduct]):
     async def has_fuel_entry_oil_rows(self, product_id: uuid.UUID) -> bool:
         result = await self.session.execute(
             select(exists().where(FuelEntryOilRow.product_id == product_id))
+        )
+        return bool(result.scalar())
+
+    # A saved Pump 2 oil row copies whichever purchase-batch cost the manager
+    # picked into its own stock_rate at save time (see FuelEntryService) —
+    # it's a snapshot, not a live FK to Lubricant_Purchase_History, but that
+    # copied number is still exactly what LubricantService.delete_purchase
+    # needs to check before letting a batch disappear out from under a
+    # sale that was priced against it. Only 'final' entries count — a
+    # draft's rows aren't a confirmed sale yet and get freely
+    # discarded/rewritten (same reasoning as get_sales_history above).
+    async def has_final_oil_row_at_rate(self, product_id: uuid.UUID, rate) -> bool:
+        result = await self.session.execute(
+            select(exists().where(
+                FuelEntryOilRow.product_id == product_id,
+                FuelEntryOilRow.stock_rate == rate,
+                FuelEntryOilRow.fuel_entry_id.in_(
+                    select(FuelEntry.id).where(FuelEntry.status == "final")
+                ),
+            ))
         )
         return bool(result.scalar())
 

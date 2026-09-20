@@ -111,6 +111,27 @@ class LubricantService:
         await self.session.flush()
         return await self.get_product(product_id)
 
+    # Unlike a purchase batch (see delete_purchase below), a price-history
+    # row is never referenced anywhere else — it's the SELLING price shown
+    # on this screen only; Pump 2's oil rows price themselves off a
+    # purchase batch's cost (purchase_history), a separate table entirely,
+    # never this one. So the only real integrity rule here is the same one
+    # salary history already enforces (see EmployeeService): a product must
+    # always have at least one price on record, since deleting the last one
+    # would leave nothing for currentRate()/rateOnDate() to fall back on.
+    async def delete_price_revision(self, product_id: uuid.UUID, revision_id: uuid.UUID, actor: User) -> LubricantProduct:
+        product = await self.get_product(product_id)
+        revision = next((h for h in product.price_history if h.id == revision_id), None)
+        if revision is None:
+            raise NotFoundError("Price revision not found.")
+        if len(product.price_history) <= 1:
+            raise ConflictError("A product must have at least one price on record.")
+        await self.products.delete_price_revision(revision)
+        product.updated_by = actor.id
+        await self.session.flush()
+        self.session.expire(product, ["price_history"])
+        return await self.get_product(product_id)
+
     async def add_purchase(self, product_id: uuid.UUID, data: PurchaseCreate, actor: User) -> LubricantProduct:
         product = await self.get_product(product_id)
         purchase = LubricantPurchaseHistory(
@@ -167,6 +188,20 @@ class LubricantService:
         purchase = next((p for p in product.purchase_history if p.id == purchase_id), None)
         if purchase is None:
             raise NotFoundError("Purchase record not found.")
+        # A saved Pump 2 oil row (Pocket/Servo oil) picks its Rate from this
+        # exact batch's cost and copies that number in at save time — it's
+        # the only place this purchase batch is ever actually referenced
+        # from. Deleting it out from under that sale would leave the sale's
+        # own Rate pointing at a batch that no longer exists anywhere, with
+        # no way back to what it actually cost. Checked before the
+        # stock-negative guard below since this is the more specific,
+        # more actionable reason to block the delete.
+        if await self.products.has_final_oil_row_at_rate(product_id, purchase.cost):
+            raise ConflictError(
+                f"This purchase (₹{purchase.cost} per {product.unit}) is still used by a saved Pump 2 fuel "
+                "entry's Pocket/Servo oil row — remove or change that oil row's rate on the fuel entry it "
+                "was saved on first, then this purchase can be deleted."
+            )
         resulting_stock = (product.stock or 0) - purchase.qty
         if resulting_stock < 0:
             raise ConflictError(
