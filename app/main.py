@@ -1,4 +1,3 @@
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,12 +11,10 @@ from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
-from sqlalchemy import text
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.v1.router import api_router
 from app.core.config import get_settings
-from app.core.database import AsyncSessionLocal
 from app.core.exceptions import AppError
 from app.core.middleware import SecurityHeadersMiddleware
 from app.core.rate_limit import limiter
@@ -32,31 +29,10 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(
 settings = get_settings()
 logger = logging.getLogger("app")
 
-# Neon (and similar serverless Postgres) suspends its compute after a few
-# minutes idle — the next real request then pays a multi-second cold-start
-# wake-up cost. Pinging on an interval well under that keeps the compute
-# permanently warm so users never see that delay, at the cost of the tiny
-# amount of compute time this trivial query itself uses.
-DB_KEEPALIVE_INTERVAL_SECONDS = 180
-
-
-async def _db_keepalive_loop() -> None:
-    while True:
-        try:
-            async with AsyncSessionLocal() as session:
-                await session.execute(text("SELECT 1"))
-        except Exception:
-            logger.exception("DB keep-alive ping failed")
-        await asyncio.sleep(DB_KEEPALIVE_INTERVAL_SECONDS)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(_db_keepalive_loop())
-    try:
-        yield
-    finally:
-        task.cancel()
+    yield
 
 
 app = FastAPI(
