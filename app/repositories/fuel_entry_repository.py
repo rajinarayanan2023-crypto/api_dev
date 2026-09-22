@@ -79,3 +79,14 @@ class FuelEntryRepository(BaseRepository[FuelEntry]):
             )
         )
         return result.scalar_one()
+
+    # Used after a delete to decide whether a Fuel_Stock_Log checkpoint for
+    # this same (date, is_shift3) scope is now orphaned — shift_number == 3
+    # is its own scope (Shift 3's checkpoint), shift_number in (1, 2) is the
+    # main day's scope. Deleting one of several entries in a scope that still
+    # has others left must NOT count as empty (see FuelEntryService.delete).
+    async def count_for_date_scope(self, day: date, is_shift3: bool) -> int:
+        query = select(func.count()).select_from(FuelEntry).where(FuelEntry.date == day)
+        query = query.where(FuelEntry.shift_number == 3) if is_shift3 else query.where(FuelEntry.shift_number != 3)
+        result = await self.session.execute(query)
+        return result.scalar_one()

@@ -4,6 +4,8 @@ from app.models.credit import CreditCustomer, CreditCustomerBill, CreditLedgerEn
 from app.models.employee import Employee, EmployeeCredit, EmployeeSalaryHistory
 from app.models.expense import ExpenseDay, ExpenseItem
 from app.models.fuel_entry import FuelEntry, FuelEntryBill, FuelEntryOilRow, FuelReading, PaymentLine
+from app.models.fuel_rate import FuelRateHistory
+from app.models.fuel_stock_log import FuelStockLog
 from app.models.lubricant import LubricantPriceHistory, LubricantProduct, LubricantPurchaseHistory
 from app.models.offer import OfferCustomer, OfferSend, OfferSendRecipient
 from app.models.refresh_token import RefreshToken
@@ -26,6 +28,8 @@ __all__ = [
     "FuelEntryBill",
     "FuelEntryOilRow",
     "FuelReading",
+    "FuelRateHistory",
+    "FuelStockLog",
     "PaymentLine",
     "LubricantPriceHistory",
     "LubricantProduct",

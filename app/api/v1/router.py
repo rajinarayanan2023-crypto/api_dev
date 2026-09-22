@@ -8,6 +8,8 @@ from app.controllers.dashboard_controller import router as dashboard_router
 from app.controllers.employee_controller import router as employee_router
 from app.controllers.expense_controller import router as expense_router
 from app.controllers.fuel_entry_controller import router as fuel_entry_router
+from app.controllers.fuel_rate_controller import router as fuel_rate_router
+from app.controllers.fuel_stock_log_controller import router as fuel_stock_log_router
 from app.controllers.lubricant_controller import router as lubricant_router
 from app.controllers.offer_controller import router as offer_router
 from app.controllers.offer_customer_controller import router as offer_customer_router
@@ -30,5 +32,7 @@ api_router.include_router(dashboard_router)
 api_router.include_router(offer_router)
 api_router.include_router(offer_customer_router)
 api_router.include_router(fuel_entry_router)
+api_router.include_router(fuel_rate_router)
+api_router.include_router(fuel_stock_log_router)
 api_router.include_router(upload_router)
 api_router.include_router(whatsapp_webhook_router)

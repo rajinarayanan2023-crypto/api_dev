@@ -16,6 +16,7 @@ from app.models.fuel_entry import FuelEntry, FuelEntryBill, FuelEntryOilRow, Fue
 from app.models.user import User
 from app.repositories.attendance_repository import AttendanceRepository
 from app.repositories.fuel_entry_repository import FuelEntryRepository
+from app.repositories.fuel_stock_log_repository import FuelStockLogRepository
 from app.repositories.lubricant_repository import LubricantRepository
 from app.schemas.fuel_entry import FuelEntryWrite
 from app.services.audit import attach_actor_names
@@ -48,6 +49,7 @@ class FuelEntryService:
         self.session = session
         self.entries = FuelEntryRepository(session)
         self.attendance = AttendanceRepository(session)
+        self.stock_logs = FuelStockLogRepository(session)
 
     # ---------- assembling ORM rows from a write payload ----------
 
@@ -514,7 +516,24 @@ class FuelEntryService:
         await self._remove_employee_credit_by_source(entry_id)
         bill_keys = [b.file_url for b in existing.bills]
         invalidate_dashboard_month(existing.date.strftime("%Y-%m"))
+        deleted_date, deleted_is_shift3 = existing.date, existing.shift_number == 3
         await self.entries.delete(existing)
+        # If that was the LAST entry in this (date, is_shift3) scope, any
+        # saved Fuel_Stock_Log checkpoint for it is now orphaned — its Sold
+        # figure would compute as 0 (nothing left to read a meter boundary
+        # from), and worse, a later date's own Opening Stock default would
+        # still silently carry forward from it (see AuditModal.jsx's
+        # previousStockCheckpoint) as if it were still a real reading.
+        # Deleting one of SEVERAL entries in a scope that still has others
+        # left must NOT trigger this — the checkpoint is still perfectly
+        # valid, backed by what's left, and re-typing Opening Stock/Stock
+        # Received on every routine shift correction would be needless
+        # busywork for the manager.
+        remaining = await self.entries.count_for_date_scope(deleted_date, deleted_is_shift3)
+        if remaining == 0:
+            orphaned_log = await self.stock_logs.get_by_date(deleted_date, deleted_is_shift3)
+            if orphaned_log is not None:
+                await self.stock_logs.delete(orphaned_log)
         for key in bill_keys:
             delete_object(key)
 
