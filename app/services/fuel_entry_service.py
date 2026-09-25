@@ -1,5 +1,5 @@
 import uuid
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -9,12 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.cache import invalidate_dashboard_month
 from app.core.exceptions import AppError, ConflictError, NotFoundError
 from app.core.s3 import delete_object
-from app.models.attendance import AttendanceRecord
 from app.models.credit import CreditCustomer, CreditLedgerEntry
 from app.models.employee import Employee, EmployeeCredit
 from app.models.fuel_entry import FuelEntry, FuelEntryBill, FuelEntryOilRow, FuelReading, PaymentLine
 from app.models.user import User
-from app.repositories.attendance_repository import AttendanceRepository
 from app.repositories.fuel_entry_repository import FuelEntryRepository
 from app.repositories.fuel_stock_log_repository import FuelStockLogRepository
 from app.repositories.lubricant_repository import LubricantRepository
@@ -34,12 +32,14 @@ def _reading_amount(opening: Decimal, closing: Decimal, testing: Decimal, rate: 
 
 
 class FuelEntryService:
-    """Owns the full save-time cascade Fuel Entry drives into three other
-    modules — see ui/src/context/DataContext.jsx's applyAttendanceFromEntry/
+    """Owns the full save-time cascade Fuel Entry drives into other
+    modules — credit ledger, employee credit, and Pump 2 oil stock. A Fuel
+    Entry's employee_id is kept purely as a reference (who worked the
+    shift); it deliberately does NOT drive Attendance in any way — Attendance
+    is managed entirely by hand on its own screen and salary is calculated
+    from those manual records only. See ui/src/context/DataContext.jsx's
     applyCreditLedgerFromEntry/applyEmployeeCreditFromEntry/
-    applyOilStockFromEntry, which this reproduces exactly (including their
-    accepted quirks — e.g. attendance is only ever forward re-derived from
-    the entry's current employee_id, never reversed for a previous one).
+    applyOilStockFromEntry, which this reproduces exactly.
 
     None of these side effects fire for a draft — only a 'final' save
     triggers them, and only a 'final' save requires at least one bill.
@@ -48,7 +48,6 @@ class FuelEntryService:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.entries = FuelEntryRepository(session)
-        self.attendance = AttendanceRepository(session)
         self.stock_logs = FuelStockLogRepository(session)
 
     # ---------- assembling ORM rows from a write payload ----------
@@ -310,29 +309,6 @@ class FuelEntryService:
 
     # ---------- side-effect cascade ----------
 
-    async def _upsert_attendance(self, employee_id: uuid.UUID, day, status: str, actor: User) -> None:
-        existing = await self.attendance.get_by_employee_and_date(employee_id, day)
-        if existing is not None:
-            existing.status = status
-            existing.updated_by = actor.id
-        else:
-            self.session.add(
-                AttendanceRecord(employee_id=employee_id, date=day, status=status, created_by=actor.id, updated_by=actor.id)
-            )
-        await self.session.flush()
-
-    async def _apply_attendance(self, entry: FuelEntry, actor: User) -> None:
-        if entry.internal_only or entry.employee_id is None:
-            return
-        count = await self.entries.count_final_for_employee_on_date(entry.employee_id, entry.date)
-        status = "double_shift" if count >= 2 else "one_shift"
-        await self._upsert_attendance(entry.employee_id, entry.date, status, actor)
-        if status == "double_shift":
-            next_date = entry.date + timedelta(days=1)
-            existing_next = await self.attendance.get_by_employee_and_date(entry.employee_id, next_date)
-            if existing_next is None:
-                await self._upsert_attendance(entry.employee_id, next_date, "duty_off", actor)
-
     async def _apply_credit_ledger(self, entry: FuelEntry) -> None:
         candidate_ids = {p.customer_id for p in entry.payment_lines if p.type == "credit" and p.customer_id and p.amount and p.amount > 0}
         if not candidate_ids:
@@ -425,8 +401,7 @@ class FuelEntryService:
             await self.session.delete(row)
         await self.session.flush()
 
-    async def _apply_side_effects(self, entry: FuelEntry, actor: User) -> None:
-        await self._apply_attendance(entry, actor)
+    async def _apply_side_effects(self, entry: FuelEntry) -> None:
         await self._apply_credit_ledger(entry)
         await self._apply_employee_credit(entry)
         await self._apply_oil_stock(entry, -1)
@@ -447,7 +422,7 @@ class FuelEntryService:
                 raise ConflictError("A shift entry already exists for this date, pump, and shift number.") from exc
             raise
         if data.status == "final":
-            await self._apply_side_effects(entry, actor)
+            await self._apply_side_effects(entry)
         invalidate_dashboard_month(entry.date.strftime("%Y-%m"))
         full = await self.entries.get_with_details(entry.id)
         await attach_actor_names(self.session, [full])
@@ -475,8 +450,9 @@ class FuelEntryService:
         previous_month = existing.date.strftime("%Y-%m")
 
         # Reverse this entry's previous side effects before rebuilding it —
-        # attendance is intentionally NOT reversed here (see class docstring),
-        # only re-derived forward below if the new status is final.
+        # attendance is never touched here at all (see class docstring: Fuel
+        # Entry keeps employee_id purely as a reference and never drives
+        # Attendance in either direction).
         if existing.status == "final":
             await self._apply_oil_stock(existing, 1)
         await self._remove_credit_ledger_by_source(entry_id)
@@ -492,7 +468,7 @@ class FuelEntryService:
             raise
 
         if data.status == "final":
-            await self._apply_side_effects(existing, actor)
+            await self._apply_side_effects(existing)
 
         invalidate_dashboard_month(previous_month)
         invalidate_dashboard_month(data.date.strftime("%Y-%m"))

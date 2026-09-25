@@ -1,8 +1,14 @@
 from functools import lru_cache
 from urllib.parse import quote_plus
 
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The one real production database. Local dev/test .env files must never
+# point here — this got mixed up once (local .env silently held production
+# credentials for days), so this is enforced at startup below rather than
+# left to a comment someone might not read next time.
+_PRODUCTION_POSTGRES_HOST = "ep-wispy-scene-b3zlzr12.c-4.ap-southeast-1.aws.neon.tech"
 
 
 class Settings(BaseSettings):
@@ -146,6 +152,17 @@ class Settings(BaseSettings):
     def secret_key_must_not_be_placeholder(cls, v: str) -> str:
         if v.startswith("replace-with") or v.startswith("change-this"):
             raise ValueError("SECRET_KEY must be set to a real secret, not the placeholder value")
+        return v
+
+    @field_validator("postgres_host")
+    @classmethod
+    def guard_against_production_db_outside_production(cls, v: str, info: ValidationInfo) -> str:
+        environment = (info.data or {}).get("environment", "development")
+        if environment != "production" and v == _PRODUCTION_POSTGRES_HOST:
+            raise ValueError(
+                "Refusing to start: ENVIRONMENT is not 'production' but POSTGRES_HOST points at the "
+                "production database. Local/dev/test runs must use a separate Neon project."
+            )
         return v
 
     @property

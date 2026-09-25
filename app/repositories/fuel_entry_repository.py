@@ -69,17 +69,6 @@ class FuelEntryRepository(BaseRepository[FuelEntry]):
         )
         return list(result.scalars().all())
 
-    async def count_final_for_employee_on_date(self, employee_id: uuid.UUID, day: date) -> int:
-        result = await self.session.execute(
-            select(func.count()).select_from(FuelEntry).where(
-                FuelEntry.employee_id == employee_id,
-                FuelEntry.date == day,
-                FuelEntry.internal_only.is_(False),
-                FuelEntry.status == "final",
-            )
-        )
-        return result.scalar_one()
-
     # Used after a delete to decide whether a Fuel_Stock_Log checkpoint for
     # this same (date, is_shift3) scope is now orphaned — shift_number == 3
     # is its own scope (Shift 3's checkpoint), shift_number in (1, 2) is the

@@ -32,19 +32,21 @@ class FuelEntry(Base, UUIDPkMixin, AuditMixin):
         Index("idx_fuel_entries_date", "date"),
         Index("idx_fuel_entries_pump_date", "pump_key", "date"),
         Index("idx_fuel_entries_employee", "employee_id"),
-        # Matches count_final_for_employee_on_date's exact filter (the
-        # attendance auto-mark cascade, run on every finalized fuel entry) —
-        # migration d4a7e2c9f1b3. idx_fuel_entries_employee above is now
-        # largely superseded by this via the leftmost-prefix rule but is
-        # left in place; this migration only adds what was missing.
+        # Speeds up employee+date lookups (e.g. an employee's entries for a
+        # given day) — migration d4a7e2c9f1b3. idx_fuel_entries_employee
+        # above is now largely superseded by this via the leftmost-prefix
+        # rule but is left in place; this migration only adds what was missing.
         Index("idx_fuel_entries_employee_date", "employee_id", "date"),
     )
 
     date: Mapped[date] = mapped_column(Date, nullable=False)
     pump_key: Mapped[str] = mapped_column(Text, nullable=False)
     shift_number: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    # true only for shift 3; excluded from attendance auto-marking
+    # true only for shift 3 (internal/company use, not a customer-facing shift)
     internal_only: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    # Reference only — who worked this shift. Never drives Attendance in
+    # either direction; Attendance is managed entirely by hand on its own
+    # screen and salary is calculated from those manual records only.
     employee_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("Employees.id", ondelete="SET NULL")
     )
