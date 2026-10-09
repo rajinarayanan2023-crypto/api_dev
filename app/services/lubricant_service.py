@@ -23,22 +23,21 @@ class LubricantService:
         payload = data.model_dump(exclude={"opening_rate", "opening_stock"})
         product = LubricantProduct(**payload, stock=data.opening_stock, created_by=actor.id, updated_by=actor.id)
         today = date.today()
-        # Opening stock is itself the product's first purchase — recorded
-        # against the rate just entered (the only price this form actually
-        # collects), rather than a hardcoded 0, which showed as an obviously
-        # wrong "₹0/unit" in Purchase History for stock the manager had just
-        # priced. Not a true acquisition cost (there's no separate "what did
-        # you pay for the opening stock" field), but it's the only real
-        # figure available here and is far closer to correct than 0 — and it
-        # keeps stockAvailableAtRate's per-price-period counting correct from
-        # day one, once the price is ever revised, same as before.
-        if data.opening_stock > 0:
-            product.purchase_history = [
-                LubricantPurchaseHistory(
-                    date=today, qty=data.opening_stock, cost=data.opening_rate,
-                    created_by=actor.id, updated_by=actor.id,
-                )
-            ]
+        # Always recorded, even at qty 0 (no opening stock yet) — this row is
+        # the ONLY place the rate just entered on this form ever gets saved
+        # (the selling-price/Revise Price system that used to track it
+        # separately is gone), so the product card's "Cost" display
+        # (latestPurchaseCost -> lastPurchaseOf, see utils/lubricants.js)
+        # has nothing to read from without it. A qty-0 row is harmless
+        # everywhere else that reads purchase_history: it contributes 0 to
+        # purchaseBatchesByCost's totals and to this product's stock, same
+        # as if nothing had been bought yet.
+        product.purchase_history = [
+            LubricantPurchaseHistory(
+                date=today, qty=data.opening_stock, cost=data.opening_rate,
+                created_by=actor.id, updated_by=actor.id,
+            )
+        ]
         created = await self.products.create(product)
         # BaseRepository.create()'s refresh() expires (but does not eagerly
         # reload) relationship attributes, which would otherwise force a
@@ -231,20 +230,31 @@ class LubricantService:
         purchase = next((p for p in product.purchase_history if p.id == purchase_id), None)
         if purchase is None:
             raise NotFoundError("Purchase record not found.")
-        # A saved Pump 2 oil row (Pocket/Servo oil) picks its Rate from this
-        # exact batch's cost and copies that number in at save time — it's
-        # the only place this purchase batch is ever actually referenced
-        # from. Deleting it out from under that sale would leave the sale's
-        # own Rate pointing at a batch that no longer exists anywhere, with
-        # no way back to what it actually cost. Checked before the
+        # A saved Pump 2 oil row (Pocket/Servo oil) picks its Rate from a
+        # COST, not from this specific purchase row — so deleting one batch
+        # is safe as long as whatever's LEFT on record at that same cost
+        # (other purchase rows sharing it, if any) still covers everything
+        # already sold at it. Only genuinely blocked when removing this row
+        # would leave that cost's remaining total short of what's already
+        # been sold against it — e.g. two batches at ₹100 (20 + 10) with 11
+        # sold at ₹100: deleting the 10-batch is fine (the other 20 alone
+        # still covers the 11 sold), but deleting the 20-batch isn't (only
+        # 10 would be left, short of the 11 sold). Checked before the
         # stock-negative guard below since this is the more specific,
         # more actionable reason to block the delete.
-        if await self.products.has_final_oil_row_at_rate(product_id, purchase.cost):
-            raise ConflictError(
-                f"This purchase (₹{purchase.cost} per {product.unit}) is still used by a saved Pump 2 fuel "
-                "entry's Pocket/Servo oil row — remove or change that oil row's rate on the fuel entry it "
-                "was saved on first, then this purchase can be deleted."
+        sold_at_cost = await self.products.sum_final_oil_row_count_at_rate(product_id, purchase.cost)
+        if sold_at_cost > 0:
+            remaining_at_cost = sum(
+                p.qty for p in product.purchase_history if p.cost == purchase.cost and p.id != purchase.id
             )
+            if remaining_at_cost < sold_at_cost:
+                raise ConflictError(
+                    f"Can't delete this purchase (₹{purchase.cost} per {product.unit}) — {sold_at_cost} "
+                    f"{product.unit} have already been sold at this exact cost via a saved Pump 2 fuel entry, "
+                    f"and the other purchases at ₹{purchase.cost} only total {remaining_at_cost} {product.unit}. "
+                    "Record more stock at this cost first, or change that fuel entry's oil row rate, before "
+                    "deleting this purchase."
+                )
         resulting_stock = (product.stock or 0) - purchase.qty
         if resulting_stock < 0:
             raise ConflictError(
