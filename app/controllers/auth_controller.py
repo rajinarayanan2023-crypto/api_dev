@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_active_user, get_db_session
 from app.core.config import get_settings
-from app.core.exceptions import ForbiddenError, UnauthorizedError
+from app.core.exceptions import AppError, ForbiddenError, UnauthorizedError
 from app.core.email import send_email
 from app.core.otp_store import generate_otp, otp_expiry_phrase, verify_otp
 from app.core.rate_limit import limiter
@@ -25,10 +25,15 @@ from app.schemas.auth import (
 from app.schemas.common import Message
 from app.schemas.user import PasswordChange, UserOut
 from app.services.auth_service import AuthService
+from app.services.login_attempt_service import LoginAttemptService
 from app.services.user_service import UserService
 
 settings = get_settings()
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+def _client_ip(request: Request) -> str | None:
+    return request.client.host if request.client else None
 
 
 def _otp_email_text(otp: str, expiry_phrase: str) -> str:
@@ -109,6 +114,15 @@ async def login(
     credentials: LoginRequest,
     session: AsyncSession = Depends(get_db_session),
 ) -> LoginOtpResponse:
+    ip = _client_ip(request)
+    attempts = LoginAttemptService(session)
+    # Per-IP limiting (the @limiter.limit decorator above) can't catch many
+    # different IPs each trying a few passwords against the SAME account —
+    # this check is keyed by identifier instead, regardless of IP. Must run
+    # BEFORE the real credential check, so a locked-out attempt never gets
+    # to find out whether its guess was even close.
+    await attempts.check_lockout(credentials.identifier, "login", ip_address=ip)
+
     # Single query: identifier is matched against email OR name (see
     # UserRepository.get_by_identifier) — no separate lookups.
     user = await UserRepository(session).get_by_identifier(credentials.identifier)
@@ -120,15 +134,24 @@ async def login(
         # Still runs a hash comparison so response timing doesn't leak
         # whether the account exists.
         verify_password(credentials.password, DUMMY_PASSWORD_HASH)
+        await attempts.record(identifier=credentials.identifier, action="login", success=False, reason="no_such_user", ip_address=ip)
         raise invalid_credentials
 
     # Cheap short-circuit: reject deactivated accounts before paying for a
     # password hash comparison.
     if not user.active:
+        await attempts.record(
+            identifier=credentials.identifier, action="login", success=False, reason="account_deactivated", user_id=user.id, ip_address=ip
+        )
         raise ForbiddenError("This account has been deactivated.")
 
     if not verify_password(credentials.password, user.password_hash):
+        await attempts.record(
+            identifier=credentials.identifier, action="login", success=False, reason="wrong_password", user_id=user.id, ip_address=ip
+        )
         raise invalid_credentials
+
+    await attempts.record(identifier=credentials.identifier, action="login", success=True, user_id=user.id, ip_address=ip)
 
     # OTP goes to the user's registered email, not SMS/phone — SMS has since
     # been removed from the app entirely (Offers is WhatsApp-only now too,
@@ -156,8 +179,14 @@ async def verify_otp_route(
     body: VerifyOtpRequest,
     session: AsyncSession = Depends(get_db_session),
 ) -> VerifyOtpResponse:
+    ip = _client_ip(request)
+    attempts = LoginAttemptService(session)
+    # verify_otp() already enforces its own OTP_MAX_ATTEMPTS internally
+    # (app/core/otp_store.py) — this just records the outcome for
+    # visibility (the Login Attempts screen), not a second lockout gate.
     ok, message = verify_otp(body.user_id, body.otp)
     if not ok:
+        await attempts.record(identifier=body.user_id, action="verify_otp", success=False, reason="wrong_otp", ip_address=ip)
         raise UnauthorizedError(message)
 
     try:
@@ -168,6 +197,8 @@ async def verify_otp_route(
     user = await UserRepository(session).get(user_id)
     if user is None or not user.active:
         raise UnauthorizedError("This account is no longer available.")
+
+    await attempts.record(identifier=body.user_id, action="verify_otp", success=True, user_id=user.id, ip_address=ip)
 
     # Single DB write for the OTP step itself; issue_tokens below adds the
     # one further write it's always made (persisting the new refresh token,
@@ -209,11 +240,33 @@ async def me(current_user: User = Depends(get_current_active_user)) -> User:
 
 
 @router.post("/change-password", response_model=Message)
+@limiter.limit(settings.rate_limit_login)
 async def change_password(
+    request: Request,
     body: PasswordChange,
     current_user: User = Depends(get_current_active_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> Message:
+    # This endpoint requires an already-valid access token, so the only
+    # thing being guessed here is the CURRENT password — same shape of
+    # attack as /auth/login, just against whoever holds a live session
+    # (e.g. a stolen/shared device), which is exactly why it needs the same
+    # per-IP rate limit (decorator above) and per-account lockout (below)
+    # that login itself already had — this was the one gap called out
+    # explicitly: every other sensitive action confirms/limits, this one
+    # didn't limit at all.
+    ip = _client_ip(request)
+    attempts = LoginAttemptService(session)
+    await attempts.check_lockout(current_user.email, "change_password", ip_address=ip, user_id=current_user.id)
+
     service = UserService(session)
-    await service.change_password(current_user, body)
+    try:
+        await service.change_password(current_user, body)
+    except AppError:
+        await attempts.record(
+            identifier=current_user.email, action="change_password", success=False,
+            reason="wrong_current_password", user_id=current_user.id, ip_address=ip,
+        )
+        raise
+    await attempts.record(identifier=current_user.email, action="change_password", success=True, user_id=current_user.id, ip_address=ip)
     return Message(detail="Password changed. Please log in again.")

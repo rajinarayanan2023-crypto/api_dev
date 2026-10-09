@@ -1,13 +1,14 @@
 import uuid
 from datetime import date
+from decimal import Decimal
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ConflictError, NotFoundError
-from app.models.lubricant import LubricantPriceHistory, LubricantProduct, LubricantPurchaseHistory
+from app.models.lubricant import LubricantProduct, LubricantPurchaseHistory
 from app.models.user import User
 from app.repositories.lubricant_repository import LubricantRepository
-from app.schemas.lubricant import LubricantCreate, LubricantUpdate, PriceHistoryCreate, PurchaseCreate, PurchaseUpdate
+from app.schemas.lubricant import LubricantCreate, LubricantUpdate, PurchaseCreate, PurchaseUpdate
 from app.services.audit import attach_actor_names
 
 
@@ -22,7 +23,6 @@ class LubricantService:
         payload = data.model_dump(exclude={"opening_rate", "opening_stock"})
         product = LubricantProduct(**payload, stock=data.opening_stock, created_by=actor.id, updated_by=actor.id)
         today = date.today()
-        product.price_history = [LubricantPriceHistory(effective_from=today, rate=data.opening_rate)]
         # Opening stock is itself the product's first purchase — recorded
         # against the rate just entered (the only price this form actually
         # collects), rather than a hardcoded 0, which showed as an obviously
@@ -34,7 +34,10 @@ class LubricantService:
         # day one, once the price is ever revised, same as before.
         if data.opening_stock > 0:
             product.purchase_history = [
-                LubricantPurchaseHistory(date=today, qty=data.opening_stock, cost=data.opening_rate)
+                LubricantPurchaseHistory(
+                    date=today, qty=data.opening_stock, cost=data.opening_rate,
+                    created_by=actor.id, updated_by=actor.id,
+                )
             ]
         created = await self.products.create(product)
         # BaseRepository.create()'s refresh() expires (but does not eagerly
@@ -46,14 +49,21 @@ class LubricantService:
 
     async def _attach_sales_summary(self, products: list[LubricantProduct]) -> None:
         summary = await self.products.get_sales_summary([p.id for p in products])
+        sold_by_rate = await self.products.get_sold_count_by_rate([p.id for p in products])
         for product in products:
             last_date, total_qty = summary.get(product.id, (None, None))
             product.last_sold_date = last_date
             product.total_sold = total_qty or 0
+            # Keyed by the rate as a string (Decimal isn't a valid JSON
+            # object key) — see LubricantOut.sold_count_by_rate.
+            product.sold_count_by_rate = {
+                str(rate): qty for rate, qty in sold_by_rate.get(product.id, {}).items()
+            }
 
     async def list_products(self, offset: int = 0, limit: int = 100) -> list[LubricantProduct]:
         products = await self.products.list_with_history(offset=offset, limit=limit)
         await attach_actor_names(self.session, products)
+        await attach_actor_names(self.session, [h for p in products for h in p.purchase_history])
         await self._attach_sales_summary(products)
         return products
 
@@ -62,6 +72,7 @@ class LubricantService:
         if product is None:
             raise NotFoundError("Lubricant product not found.")
         await attach_actor_names(self.session, [product])
+        await attach_actor_names(self.session, product.purchase_history)
         await self._attach_sales_summary([product])
         return product
 
@@ -80,67 +91,86 @@ class LubricantService:
         if updates:
             # Refresh only the columns just written — an unqualified
             # refresh() also expires (without reloading) relationship
-            # attributes like price_history, which would then crash Pydantic
-            # serialization by forcing a lazy-load outside an active await.
+            # attributes like purchase_history, which would then crash
+            # Pydantic serialization by forcing a lazy-load outside an
+            # active await.
             await self.session.refresh(product, attribute_names=[*updates.keys(), "updated_by", "updated_at"])
         await attach_actor_names(self.session, [product])
         return product
 
-    # Replaces the existing row instead of inserting a duplicate when
-    # effective_from matches one already on record (e.g. a same-day
-    # correction to a brand-new product's opening rate) — the table has a
-    # unique constraint on (product_id, effective_from), so a plain insert
-    # would otherwise raise IntegrityError for what the manager sees as an edit.
-    async def add_price_revision(self, product_id: uuid.UUID, data: PriceHistoryCreate, actor: User) -> LubricantProduct:
-        product = await self.get_product(product_id)
-        existing = next((h for h in product.price_history if h.effective_from == data.effective_from), None)
-        if existing is not None:
-            existing.rate = data.rate
-        else:
-            revision = LubricantPriceHistory(
-                product_id=product.id, effective_from=data.effective_from, rate=data.rate
+    # Checked before ANY qty reduction (a Record Purchase upsert replacing an
+    # existing batch's qty with a smaller one, or a direct edit via
+    # update_purchase below) — the more specific, more useful reason first:
+    # this exact cost's batch may already have sales against it that the
+    # OVERALL running `product.stock` alone can't reveal, since stock is one
+    # aggregate column with no idea which batch a past sale came out of. A
+    # product with TWO untouched batches (say 12 @ ₹26 and 8 @ ₹25, only the
+    # ₹25 one ever sold from) has plenty of overall headroom from the ₹26
+    # batch alone — the overall-stock check below would wave through
+    # shrinking the ₹25 batch down well past what's actually been sold out
+    # of it specifically, silently making "Available" at that rate read as
+    # if those already-sold units were still sitting on the shelf. Querying
+    # the real per-batch sold count (sum_final_oil_row_count_at_rate) is
+    # what actually catches that. The overall-stock check stays too, as a
+    # second, cruder backstop for the same class of problem.
+    async def _guard_qty_reduction(
+        self, product_id: uuid.UUID, cost, new_qty: int, product: LubricantProduct, delta: int
+    ) -> Decimal:
+        sold_at_rate = await self.products.sum_final_oil_row_count_at_rate(product_id, cost)
+        if new_qty < sold_at_rate:
+            raise ConflictError(
+                f"Can't reduce this purchase (₹{cost} per {product.unit}) to {new_qty} {product.unit} — "
+                f"{sold_at_rate} {product.unit} have already been sold out of this exact batch via a saved "
+                "Pump 2 fuel entry. Enter a larger quantity."
             )
-            await self.products.add_price_revision(revision)
-            # The new row went in through a separate object, not through
-            # product.price_history itself, so that already-loaded collection
-            # is now stale in the session's identity map — expire it so
-            # get_product() below actually re-reads it instead of returning
-            # the cached (pre-insert) collection.
-            self.session.expire(product, ["price_history"])
-        product.updated_by = actor.id
-        await self.session.flush()
-        return await self.get_product(product_id)
+        resulting_stock = (product.stock or 0) + delta
+        if resulting_stock < 0:
+            raise ConflictError(
+                f"Can't reduce this purchase to {new_qty} {product.unit} — that's "
+                f"{abs(resulting_stock)} {product.unit} more than what's left in stock, since some "
+                "of the original quantity has already been sold. Enter a larger quantity."
+            )
+        return resulting_stock
 
-    # Unlike a purchase batch (see delete_purchase below), a price-history
-    # row is never referenced anywhere else — it's the SELLING price shown
-    # on this screen only; Pump 2's oil rows price themselves off a
-    # purchase batch's cost (purchase_history), a separate table entirely,
-    # never this one. So the only real integrity rule here is the same one
-    # salary history already enforces (see EmployeeService): a product must
-    # always have at least one price on record, since deleting the last one
-    # would leave nothing for currentRate()/rateOnDate() to fall back on.
-    async def delete_price_revision(self, product_id: uuid.UUID, revision_id: uuid.UUID, actor: User) -> LubricantProduct:
-        product = await self.get_product(product_id)
-        revision = next((h for h in product.price_history if h.id == revision_id), None)
-        if revision is None:
-            raise NotFoundError("Price revision not found.")
-        if len(product.price_history) <= 1:
-            raise ConflictError("A product must have at least one price on record.")
-        await self.products.delete_price_revision(revision)
-        product.updated_by = actor.id
-        await self.session.flush()
-        self.session.expire(product, ["price_history"])
-        return await self.get_product(product_id)
-
+    # Upserts by (date, cost): two "Record Purchase" submissions for the
+    # same product, same day, at the same per-unit cost are the same real
+    # restock batch (purchaseBatchesByCost already groups/sums them that
+    # way) — inserting a second row for it used to just fragment that one
+    # batch's history into "+17" / "+12" rows side by side on the same date
+    # instead of one. A DIFFERENT cost on the same date is still a genuinely
+    # separate batch and still inserts its own row, same as before.
+    #
+    # Because this can now also shrink an existing row's qty (recording "4"
+    # over an existing "17"), it carries the same reduction guard
+    # update_purchase has below — increasing the qty is never blocked, only
+    # a reduction can ever run into it.
     async def add_purchase(self, product_id: uuid.UUID, data: PurchaseCreate, actor: User) -> LubricantProduct:
+        await self.products.lock_for_update(product_id)
         product = await self.get_product(product_id)
-        purchase = LubricantPurchaseHistory(
-            product_id=product.id, date=data.date, qty=data.qty, cost=data.cost
+        existing = next(
+            (p for p in product.purchase_history if p.date == data.date and p.cost == data.cost), None
         )
-        await self.products.add_purchase(purchase)
-        product.stock = (product.stock or 0) + data.qty
+        if existing is not None:
+            delta = data.qty - existing.qty
+            if delta < 0:
+                resulting_stock = await self._guard_qty_reduction(product_id, data.cost, data.qty, product, delta)
+            else:
+                resulting_stock = (product.stock or 0) + delta
+            existing.qty = data.qty
+            existing.updated_by = actor.id
+            product.stock = resulting_stock
+        else:
+            purchase = LubricantPurchaseHistory(
+                product_id=product.id, date=data.date, qty=data.qty, cost=data.cost,
+                created_by=actor.id, updated_by=actor.id,
+            )
+            await self.products.add_purchase(purchase)
+            product.stock = (product.stock or 0) + data.qty
         product.updated_by = actor.id
-        # Same staleness issue as add_price_revision above, for purchase_history.
+        # The new/updated row went in through a separate object, not through
+        # product.purchase_history itself, so that already-loaded collection
+        # is now stale in the session's identity map — expire it so
+        # get_product() below actually re-reads it.
         self.session.expire(product, ["purchase_history"])
         await self.session.flush()
         return await self.get_product(product_id)
@@ -158,24 +188,36 @@ class LubricantService:
     async def update_purchase(
         self, product_id: uuid.UUID, purchase_id: uuid.UUID, data: PurchaseUpdate, actor: User
     ) -> LubricantProduct:
+        await self.products.lock_for_update(product_id)
         product = await self.get_product(product_id)
         purchase = next((p for p in product.purchase_history if p.id == purchase_id), None)
         if purchase is None:
             raise NotFoundError("Purchase record not found.")
         updates = data.model_dump(exclude_unset=True)
+        # Same protection delete_purchase already has, applied to an edit
+        # instead of a removal: a saved Pump 2 oil row copies this batch's
+        # CURRENT cost into its own stock_rate at save time, so changing the
+        # cost out from under it would leave that already-finalized sale
+        # referencing a rate that no longer exists anywhere in purchase
+        # history — just as broken as deleting the batch outright, and until
+        # now completely unchecked.
+        if "cost" in updates and updates["cost"] != purchase.cost:
+            if await self.products.has_final_oil_row_at_rate(product_id, purchase.cost):
+                raise ConflictError(
+                    f"This purchase (₹{purchase.cost} per {product.unit}) is still used by a saved Pump 2 fuel "
+                    "entry's Pocket/Servo oil row — remove or change that oil row's rate on the fuel entry it "
+                    "was saved on first, then this purchase's cost can be changed."
+                )
         if "qty" in updates and updates["qty"] != purchase.qty:
             delta = updates["qty"] - purchase.qty
-            resulting_stock = (product.stock or 0) + delta
-            if resulting_stock < 0:
-                raise ConflictError(
-                    f"Can't reduce this purchase to {updates['qty']} {product.unit} — that's "
-                    f"{abs(resulting_stock)} {product.unit} more than what's left in stock, since some "
-                    "of the original quantity has already been sold. Enter a larger quantity."
-                )
-            product.stock = resulting_stock
+            if delta < 0:
+                product.stock = await self._guard_qty_reduction(product_id, purchase.cost, updates["qty"], product, delta)
+            else:
+                product.stock = (product.stock or 0) + delta
         for field, value in updates.items():
             setattr(purchase, field, value)
         if updates:
+            purchase.updated_by = actor.id
             product.updated_by = actor.id
         await self.session.flush()
         self.session.expire(product, ["purchase_history"])
@@ -184,6 +226,7 @@ class LubricantService:
     # Same stock-delta safety as update_purchase above, applied as a full
     # removal (delta = -qty) instead of a partial correction.
     async def delete_purchase(self, product_id: uuid.UUID, purchase_id: uuid.UUID, actor: User) -> LubricantProduct:
+        await self.products.lock_for_update(product_id)
         product = await self.get_product(product_id)
         purchase = next((p for p in product.purchase_history if p.id == purchase_id), None)
         if purchase is None:
@@ -216,9 +259,9 @@ class LubricantService:
         self.session.expire(product, ["purchase_history"])
         return await self.get_product(product_id)
 
-    async def get_sales_history(self, product_id: uuid.UUID) -> list[dict]:
+    async def get_sales_history(self, product_id: uuid.UUID, offset: int = 0, limit: int = 500) -> list[dict]:
         await self.get_product(product_id)  # 404s if the product doesn't exist
-        rows = await self.products.get_sales_history(product_id)
+        rows = await self.products.get_sales_history(product_id, offset=offset, limit=limit)
         return [
             {
                 "fuel_entry_id": entry.id,

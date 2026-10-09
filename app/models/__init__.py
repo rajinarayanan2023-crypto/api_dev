@@ -1,11 +1,18 @@
 from app.models.attendance import AttendanceRecord, AttendanceStatus
 from app.models.commission import CommissionRateHistory
 from app.models.credit import CreditCustomer, CreditCustomerBill, CreditLedgerEntry
-from app.models.employee import Employee, EmployeeCredit, EmployeeSalaryHistory
+from app.models.employee import (
+    Employee,
+    EmployeeCredit,
+    EmployeeSalaryHistory,
+    SalaryPayment,
+    SalaryPeriodClosure,
+)
 from app.models.expense import ExpenseDay, ExpenseItem
 from app.models.fuel_entry import FuelEntry, FuelEntryBill, FuelEntryOilRow, FuelReading, PaymentLine
 from app.models.fuel_rate import FuelRateHistory
 from app.models.fuel_stock_log import FuelStockLog
+from app.models.login_attempt import LoginAttempt
 from app.models.lubricant import LubricantPriceHistory, LubricantProduct, LubricantPurchaseHistory
 from app.models.offer import OfferCustomer, OfferSend, OfferSendRecipient
 from app.models.refresh_token import RefreshToken
@@ -30,6 +37,7 @@ __all__ = [
     "FuelReading",
     "FuelRateHistory",
     "FuelStockLog",
+    "LoginAttempt",
     "PaymentLine",
     "LubricantPriceHistory",
     "LubricantProduct",
@@ -38,6 +46,8 @@ __all__ = [
     "OfferSend",
     "OfferSendRecipient",
     "RefreshToken",
+    "SalaryPayment",
+    "SalaryPeriodClosure",
     "Station",
     "User",
     "UserRole",

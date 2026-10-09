@@ -14,6 +14,22 @@ PaymentType = Literal["cash", "credit", "employee_credit", "expense"]
 OilRowType = Literal["pocket", "cane"]
 EntryStatus = Literal["draft", "final"]
 
+# A plausibility floor, not a real business rule — same reasoning as
+# expense.py's _EARLIEST_SANE_EXPENSE_DATE. The UI's own AppDatePicker
+# already caps a NEW entry's date at today and fully disables the field
+# while editing (see FuelEntryForm.jsx), but nothing enforced either rule
+# server-side — a direct API call (or a future UI bug) could otherwise save
+# a shift dated years in the future or the distant past with no pushback.
+_EARLIEST_SANE_FUEL_ENTRY_DATE = date(1970, 1, 1)
+
+
+def _validate_fuel_entry_date(value: date) -> date:
+    if value > date.today():
+        raise ValueError("Fuel entry date cannot be in the future")
+    if value < _EARLIEST_SANE_FUEL_ENTRY_DATE:
+        raise ValueError(f"Fuel entry date cannot be before {_EARLIEST_SANE_FUEL_ENTRY_DATE.isoformat()}")
+    return value
+
 
 class FuelReadingIn(BaseModel):
     opening: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=3)
@@ -85,6 +101,8 @@ class FuelEntryWrite(BaseModel):
     payments: list[PaymentLineIn] = []
     bills: list[FuelEntryBillIn] = []
     notes: str | None = None
+
+    _validate_date = field_validator("date")(_validate_fuel_entry_date)
 
 
 class FuelReadingOut(BaseModel):

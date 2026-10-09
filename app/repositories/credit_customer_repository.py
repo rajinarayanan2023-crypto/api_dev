@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -37,6 +38,36 @@ class CreditCustomerRepository(BaseRepository[CreditCustomer]):
     async def get_ledger_entry(self, entry_id: uuid.UUID) -> CreditLedgerEntry | None:
         result = await self.session.execute(select(CreditLedgerEntry).where(CreditLedgerEntry.id == entry_id))
         return result.scalar_one_or_none()
+
+    # Acquires a row lock on this customer for the rest of the current
+    # transaction, so two near-simultaneous "add ledger entry" requests for
+    # the SAME customer can't both pass the recent-duplicate check below
+    # before either has saved — serializing them is what makes that check
+    # actually reliable instead of having its own race window.
+    async def lock_for_update(self, customer_id: uuid.UUID) -> None:
+        await self.session.execute(select(CreditCustomer.id).where(CreditCustomer.id == customer_id).with_for_update())
+
+    # Catches a double-click or two staff both recording the same real-world
+    # payment/credit within moments of each other — an exact match on the
+    # identifying fields (customer, type, date, amount), created within the
+    # last few seconds. Deliberately narrow and time-boxed: a genuinely
+    # separate transaction that happens to share the same date/amount later
+    # the same day (e.g. two real credit sales) is NOT a duplicate and must
+    # never be blocked — only something created moments ago is suspect.
+    async def get_recent_duplicate_ledger_entry(
+        self, customer_id: uuid.UUID, type: str, entry_date, amount, within_seconds: int = 10
+    ) -> CreditLedgerEntry | None:
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=within_seconds)
+        result = await self.session.execute(
+            select(CreditLedgerEntry).where(
+                CreditLedgerEntry.customer_id == customer_id,
+                CreditLedgerEntry.type == type,
+                CreditLedgerEntry.date == entry_date,
+                CreditLedgerEntry.amount == amount,
+                CreditLedgerEntry.created_at >= cutoff,
+            )
+        )
+        return result.scalars().first()
 
     async def get_with_details(self, id: uuid.UUID) -> CreditCustomer | None:
         result = await self.session.execute(select(CreditCustomer).options(*_WITH_DETAIL).where(CreditCustomer.id == id))

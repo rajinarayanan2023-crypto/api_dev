@@ -42,3 +42,15 @@ class UnsupportedMediaTypeError(AppError):
 class PayloadTooLargeError(AppError):
     status_code = 413
     detail = "File is too large."
+
+
+class TooManyAttemptsError(AppError):
+    """Account-level lockout (see LoginAttemptService) — distinct from
+    slowapi's RateLimitExceeded, which is per-IP only and can't catch many
+    different IPs guessing the same account's password. 429, same as a rate
+    limit, since the right client behavior (back off, retry later) is
+    identical either way.
+    """
+
+    status_code = 429
+    detail = "Too many failed attempts. Please try again later."

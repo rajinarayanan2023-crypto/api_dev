@@ -1,8 +1,8 @@
 import uuid
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Index, Numeric, Text, text
+from sqlalchemy import CheckConstraint, Date, ForeignKey, Index, Numeric, Text, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -41,8 +41,14 @@ class CreditCustomerBill(Base, UUIDPkMixin):
     customer: Mapped["CreditCustomer"] = relationship(back_populates="bills")
 
 
-class CreditLedgerEntry(Base, UUIDPkMixin):
-    """Closing balance for a customer = opening_balance + SUM(credit) - SUM(payment)."""
+class CreditLedgerEntry(Base, UUIDPkMixin, AuditMixin):
+    """Closing balance for a customer = opening_balance + SUM(credit) - SUM(payment).
+
+    Gained AuditMixin for the same reason EmployeeCredit/EmployeeSalaryHistory
+    did — a money-moving row is worth knowing who entered it, and until now
+    only a bare created_at (no created_by at all) existed. AuditMixin's own
+    created_at/updated_at replace that bare column.
+    """
 
     __tablename__ = "Credit_Ledger_Entries"
     __table_args__ = (
@@ -76,6 +82,5 @@ class CreditLedgerEntry(Base, UUIDPkMixin):
     # distinct from the general per-customer documents in Credit_Customer_Bills.
     bill_file_name: Mapped[str | None] = mapped_column(Text)
     bill_file_url: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 
     customer: Mapped["CreditCustomer"] = relationship(back_populates="ledger_entries")

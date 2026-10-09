@@ -80,6 +80,7 @@ async def send_audit_email(
     subject: str = Form(...),
     body_text: str = Form(...),
     attachment: UploadFile = File(...),
+    current_user: User = Depends(require_manager_or_admin),
 ) -> None:
     attachment_bytes = await attachment.read()
     send_email(

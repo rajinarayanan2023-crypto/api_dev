@@ -7,8 +7,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cache import invalidate_dashboard_month
+from app.core.database import queue_file_deletion
 from app.core.exceptions import AppError, ConflictError, NotFoundError
-from app.core.s3 import delete_object
 from app.models.credit import CreditCustomer, CreditLedgerEntry
 from app.models.employee import Employee, EmployeeCredit
 from app.models.fuel_entry import FuelEntry, FuelEntryBill, FuelEntryOilRow, FuelReading, PaymentLine
@@ -18,6 +18,7 @@ from app.repositories.fuel_stock_log_repository import FuelStockLogRepository
 from app.repositories.lubricant_repository import LubricantRepository
 from app.schemas.fuel_entry import FuelEntryWrite
 from app.services.audit import attach_actor_names
+from app.services.salary_period_closure_service import SalaryPeriodClosureService
 
 _FUEL_KEYS = ("petrol", "diesel", "oil")
 _NOZZLE_KEYS = ("nozzle1", "nozzle2")
@@ -31,6 +32,74 @@ def _reading_amount(opening: Decimal, closing: Decimal, testing: Decimal, rate: 
     return _reading_liters(opening, closing, testing) * rate
 
 
+# (total_sale_amount, total_payments) for one entry — mirrors _serialize's
+# own totals exactly (same cane_oil_offer discount, floored at 0), factored
+# out so _apply_shift_variance_credit can use the identical numbers without
+# duplicating _serialize's larger per-nozzle/per-row breakdown.
+def _shift_totals(entry: FuelEntry) -> tuple[Decimal, Decimal]:
+    fuel_amount_total = Decimal("0")
+    for r in entry.readings:
+        fuel_amount_total += _reading_amount(r.opening, r.closing, r.testing, r.rate)
+
+    pocket_oil_total = Decimal("0")
+    cane_oil_raw_total = Decimal("0")
+    for row in entry.oil_rows:
+        amount = (row.stock_count or Decimal("0")) * (row.stock_rate or Decimal("0"))
+        if row.row_type == "pocket":
+            pocket_oil_total += amount
+        else:
+            cane_oil_raw_total += amount
+    cane_oil_total = max(Decimal("0"), cane_oil_raw_total - (entry.cane_oil_offer or Decimal("0")))
+
+    total_sale_amount = fuel_amount_total + pocket_oil_total + cane_oil_total
+    total_payments = sum((p.amount or Decimal("0") for p in entry.payment_lines), Decimal("0"))
+    return total_sale_amount, total_payments
+
+
+_FUEL_LABELS = {"petrol": "Petrol", "diesel": "Diesel", "oil": "Oil"}
+_NOZZLE_LABELS = {"nozzle1": "Nozzle 1", "nozzle2": "Nozzle 2"}
+
+
+def _validate_final_readings(data: FuelEntryWrite) -> None:
+    """A final entry's numbers are real, reported revenue, so they're only
+    allowed to be physically sane. Only checked on a status='final' save
+    (never a draft, which is still a work in progress) and per-reading:
+
+    - closing - opening - testing < 0 is impossible for a real meter (it
+      only ever counts up through a shift, and testing draws down from
+      whatever it actually counted) — rejected outright rather than silently
+      treated as "0 litres sold" (see _reading_liters' own floor at 0), which
+      would hide exactly the kind of backwards/reset reading, or a Testing
+      value bigger than what the meter actually moved, that a fuel inspector
+      would flag. Mirrors the UI's own isReadingClosingTooLow in
+      PumpDayEditor.jsx exactly — this used to only check closing < opening,
+      silently accepting (as a quiet 0-litre reading) a save the UI itself
+      already refuses to allow, reachable only by calling this API directly
+      rather than through a day-to-day mistake in the app.
+    - A reading with real litres sold but rate left at 0 would otherwise
+      silently record that fuel as given away for free. A genuinely unused
+      nozzle (0 litres) legitimately has no rate to set, so this only fires
+      when there's an actual positive litres figure attached to it.
+    """
+    if data.status != "final":
+        return
+    nozzles_by_fuel = {"petrol": data.petrol, "diesel": data.diesel, "oil": data.oil}
+    for fuel_key in _FUEL_KEYS:
+        nozzles = nozzles_by_fuel[fuel_key]
+        if nozzles is None:
+            continue
+        for nozzle_key in _NOZZLE_KEYS:
+            r = getattr(nozzles, nozzle_key)
+            label = f"{_FUEL_LABELS[fuel_key]} {_NOZZLE_LABELS[nozzle_key]}"
+            if (r.closing - r.opening - r.testing) < 0:
+                raise AppError(
+                    f"{label}: closing reading ({r.closing}) is less than opening ({r.opening}) plus "
+                    f"testing ({r.testing}) — check the meter readings before finalizing."
+                )
+            if _reading_liters(r.opening, r.closing, r.testing) > 0 and r.rate <= 0:
+                raise AppError(f"{label} has litres sold but no rate set — enter a rate before finalizing.")
+
+
 class FuelEntryService:
     """Owns the full save-time cascade Fuel Entry drives into other
     modules — credit ledger, employee credit, and Pump 2 oil stock. A Fuel
@@ -42,13 +111,14 @@ class FuelEntryService:
     applyOilStockFromEntry, which this reproduces exactly.
 
     None of these side effects fire for a draft — only a 'final' save
-    triggers them, and only a 'final' save requires at least one bill.
+    triggers them.
     """
 
     def __init__(self, session: AsyncSession):
         self.session = session
         self.entries = FuelEntryRepository(session)
         self.stock_logs = FuelStockLogRepository(session)
+        self.period_closures = SalaryPeriodClosureService(session)
 
     # ---------- assembling ORM rows from a write payload ----------
 
@@ -84,14 +154,33 @@ class FuelEntryService:
         ]
         return rows
 
+    # Checked on every save (draft or final), not just _build_payments'
+    # payment-line employee_id checks — a stale/nonexistent top-level
+    # employee_id is the same class of "vanishing reference" bug those
+    # guard against. Required outright only when finalizing: a final shift's
+    # cash shortage/excess (see _apply_shift_variance_credit) needs someone
+    # to tie it to, or that money goes completely untracked.
+    async def _validate_shift_employee(self, data: FuelEntryWrite) -> None:
+        if data.employee_id is None:
+            if data.status == "final":
+                raise AppError("An employee must be assigned to finalize a shift entry.")
+            return
+        result = await self.session.execute(select(Employee.id).where(Employee.id == data.employee_id))
+        if result.scalar_one_or_none() is None:
+            raise AppError(
+                "The employee assigned to this shift no longer exists — please re-select an employee before saving."
+            )
+
     async def _build_payments(self, data: FuelEntryWrite) -> list[PaymentLine]:
         # Payment_Lines.customer_id/employee_id are themselves real FKs (not
-        # just the credit-ledger/employee-credit cascade below) — a line
-        # naming a customer that doesn't resolve to a real Credit_Customers
-        # row (Credit Bills CRUD is still deferred; the frontend's customer
-        # list is largely mock) would otherwise fail the whole insert with a
-        # ForeignKeyViolationError. Per the agreed behavior, the entry still
-        # saves — the unresolved reference is just dropped from that one line.
+        # just the credit-ledger/employee-credit cascade below). Credit Bills
+        # CRUD is a complete, real feature now (customer records are no
+        # longer "largely mock"), so a 'credit'/'employee_credit' line naming
+        # a customer/employee that doesn't resolve is a genuine data problem,
+        # not an expected gap to paper over — it used to be silently dropped
+        # (the entry still saved, the ledger effect just vanished with it:
+        # money left the pump with no record of who owes it), which is
+        # exactly the failure this now rejects instead.
         customer_ids = {p.customer_id for p in data.payments if p.customer_id}
         employee_ids = {p.employee_id for p in data.payments if p.employee_id}
         valid_customer_ids: set[uuid.UUID] = set()
@@ -102,6 +191,20 @@ class FuelEntryService:
         if employee_ids:
             result = await self.session.execute(select(Employee.id).where(Employee.id.in_(employee_ids)))
             valid_employee_ids = {row[0] for row in result.all()}
+
+        for p in data.payments:
+            if not p.amount or p.amount <= 0:
+                continue
+            if p.type == "credit" and p.customer_id and p.customer_id not in valid_customer_ids:
+                raise AppError(
+                    f"The customer selected for the credit line \"{p.label or 'Credit'}\" no longer exists — "
+                    "please re-select a customer before saving."
+                )
+            if p.type == "employee_credit" and p.employee_id and p.employee_id not in valid_employee_ids:
+                raise AppError(
+                    f"The employee selected for the credit line \"{p.label or 'Employee Credit'}\" no longer "
+                    "exists — please re-select an employee before saving."
+                )
 
         return [
             PaymentLine(
@@ -171,14 +274,17 @@ class FuelEntryService:
         # get their R2 object deleted — every unchanged bill costs zero R2
         # calls and zero DB writes.
         #
-        # The actual R2 deletion is NOT done here — it's the caller's job,
-        # only after the surrounding save has actually succeeded (see
-        # create()/update() below). delete_object() is irreversible and
-        # can't be rolled back the way this transaction can; doing it this
-        # early ran it before the entry's own flush() (and, on update, its
-        # side-effect cascade) had a chance to fail. A later failure would
-        # roll back the DB change while the R2 object stayed deleted —
-        # leaving a bill ROW pointing at a file that no longer exists.
+        # The actual R2 deletion is NOT done here — the caller queues these
+        # keys via queue_file_deletion (see create()/update() below), which
+        # only actually deletes them once get_db's wrapper confirms this
+        # whole request's transaction has committed. delete_object() is
+        # irreversible and can't be rolled back the way the transaction can:
+        # deleting right after THIS flush() isn't actually safe either, since
+        # flush only sends pending SQL — it doesn't commit it, and a later
+        # failure (elsewhere in this same request, or the commit itself)
+        # would still roll back the DB change while the R2 object stayed
+        # deleted, leaving a bill ROW pointing at a file that no longer
+        # exists.
         existing_bills = list(entry.bills)
         removed_keys = {b.file_url for b in existing_bills} - {b.file_url for b in data.bills}
         entry.bills = self._build_bills(data, existing_bills)
@@ -309,12 +415,31 @@ class FuelEntryService:
 
     # ---------- side-effect cascade ----------
 
-    async def _apply_credit_ledger(self, entry: FuelEntry) -> None:
+    # carry_forward_bills: {customer_id: [(bill_file_name, bill_file_url), ...]}
+    # — bills from the OLD credit-ledger rows this same edit's
+    # _remove_credit_ledger_by_source just deleted (see update()), keyed by
+    # customer so they can be reattached to whichever NEW row ends up
+    # covering that same customer. CreditBills.jsx's handleTxBillUpload
+    # explicitly documents attaching a bill straight onto a Fuel-Entry-
+    # sourced credit row as ITS intended way to give one of these a receipt
+    # (Fuel Entry's own form has no bill upload for a credit line) — but
+    # every save of this entry (even one that only touches an unrelated
+    # reading, with the credit line itself untouched) used to unconditionally
+    # delete and recreate every one of its credit-ledger rows, silently
+    # destroying that bill's reference and leaking its R2 object forever
+    # with nothing ever cleaning it up. Any bill left unclaimed once every
+    # new row has had a chance to take one (the customer's credit line was
+    # removed entirely, or there were more old bills than new rows for them)
+    # gets queued for real R2 deletion instead of leaking.
+    async def _apply_credit_ledger(
+        self, entry: FuelEntry, carry_forward_bills: dict[uuid.UUID, list[tuple[str, str]]] | None = None
+    ) -> None:
+        carry_forward_bills = carry_forward_bills or {}
         candidate_ids = {p.customer_id for p in entry.payment_lines if p.type == "credit" and p.customer_id and p.amount and p.amount > 0}
-        if not candidate_ids:
-            return
-        result = await self.session.execute(select(CreditCustomer.id).where(CreditCustomer.id.in_(candidate_ids)))
-        valid_ids = {row[0] for row in result.all()}
+        valid_ids: set[uuid.UUID] = set()
+        if candidate_ids:
+            result = await self.session.execute(select(CreditCustomer.id).where(CreditCustomer.id.in_(candidate_ids)))
+            valid_ids = {row[0] for row in result.all()}
         pump_label = "Pump 1" if entry.pump_key == "pump1" else "Pump 2"
         for p in entry.payment_lines:
             if p.type != "credit" or not p.customer_id or not p.amount or p.amount <= 0:
@@ -325,6 +450,8 @@ class FuelEntryService:
                 # doesn't resolve to a real Credit_Customers row yet (Credit
                 # Bills CRUD — create/edit a customer — is still deferred).
                 continue
+            carried = carry_forward_bills.get(p.customer_id)
+            bill_name, bill_url = carried.pop(0) if carried else (None, None)
             self.session.add(
                 CreditLedgerEntry(
                     customer_id=p.customer_id,
@@ -333,9 +460,21 @@ class FuelEntryService:
                     amount=p.amount,
                     note=(p.note or "").strip() or f"Fuel Entry — {pump_label} · Shift {entry.shift_number}",
                     source_fuel_entry_id=entry.id,
+                    bill_file_name=bill_name,
+                    bill_file_url=bill_url,
                 )
             )
+        await self._queue_unclaimed_bills(carry_forward_bills)
         await self.session.flush()
+
+    # Whatever's left in carry_forward_bills after _apply_credit_ledger has
+    # had its chance to reclaim entries from it is genuinely orphaned now —
+    # queued for a real R2 delete (not left leaking) via the same deferred,
+    # commit-gated mechanism Fuel Entry's own bills use (see queue_file_deletion).
+    async def _queue_unclaimed_bills(self, carry_forward_bills: dict[uuid.UUID, list[tuple[str, str]]]) -> None:
+        for bills in carry_forward_bills.values():
+            for _name, key in bills:
+                queue_file_deletion(self.session, key)
 
     async def _apply_employee_credit(self, entry: FuelEntry) -> None:
         candidate_ids = {p.employee_id for p in entry.payment_lines if p.type == "employee_credit" and p.employee_id and p.amount and p.amount > 0}
@@ -354,19 +493,86 @@ class FuelEntryService:
                     employee_id=p.employee_id,
                     date=entry.date,
                     amount=p.amount,
+                    type="credit",
                     note=(p.note or "").strip() or f"Fuel Entry — {pump_label} · Shift {entry.shift_number}",
                     source_fuel_entry_id=entry.id,
                 )
             )
         await self.session.flush()
 
+    # Ties the shift's own cash shortage/excess (total_payments -
+    # total_sale_amount — the same figure FuelEntryOut.excess_shortage shows)
+    # to whoever worked it, so it's not just a number on screen — it actually
+    # affects pay. A shortage is money the employee owes back (type='credit',
+    # deducted from pay, same direction as an advance); an excess is money
+    # owed back TO the employee (type='excess', added to pay). One row per
+    # entry, fully regenerated on every save exactly like
+    # _apply_employee_credit above — editing the entry's readings/payments
+    # naturally keeps this in sync, and _remove_employee_credit_by_source
+    # already deletes it (same source_fuel_entry_id) before this re-adds it.
+    async def _apply_shift_variance_credit(self, entry: FuelEntry) -> None:
+        if not entry.employee_id:
+            return
+        total_sale_amount, total_payments = _shift_totals(entry)
+        variance = total_payments - total_sale_amount
+        if not variance:
+            return
+        result = await self.session.execute(select(Employee.id).where(Employee.id == entry.employee_id))
+        if result.scalar_one_or_none() is None:
+            # Same "don't let a stale reference silently corrupt a ledger"
+            # reasoning as elsewhere — but _validate_shift_employee already
+            # rejects the save itself in this case, so this is only ever hit
+            # if the employee was deleted in the moment between that check
+            # and this side effect (ON DELETE SET NULL elsewhere means this
+            # can't happen mid-transaction, but costs nothing to guard).
+            return
+        pump_label = "Pump 1" if entry.pump_key == "pump1" else "Pump 2"
+        is_shortage = variance < 0
+        self.session.add(
+            EmployeeCredit(
+                employee_id=entry.employee_id,
+                date=entry.date,
+                amount=abs(variance),
+                type="credit" if is_shortage else "excess",
+                note=f"Fuel Entry — {pump_label} · Shift {entry.shift_number} · {'Shortage' if is_shortage else 'Excess'}",
+                source_fuel_entry_id=entry.id,
+            )
+        )
+        await self.session.flush()
+
     async def _adjust_stock(self, product_id: uuid.UUID | None, delta: Decimal) -> None:
         if not product_id or not delta:
             return
-        product = await LubricantRepository(self.session).get(product_id)
+        lubricants = LubricantRepository(self.session)
+        # Closes the same race LubricantService's own purchase add/edit/
+        # delete guard against — this is the OTHER code path that mutates
+        # the same product.stock column (a Pump 2 oil sale), and without the
+        # same lock here, a purchase and a sale finalized at nearly the same
+        # instant could each read the same starting stock value and one
+        # change silently overwrites the other.
+        await lubricants.lock_for_update(product_id)
+        product = await lubricants.get(product_id)
         if product is None:
             return
-        product.stock = (product.stock or Decimal("0")) + delta
+        resulting_stock = (product.stock or Decimal("0")) + delta
+        # Only guarded going DOWN (a sale) — never on a positive delta
+        # (reversing a previous sale before an edit/delete rebuilds it, or
+        # restoring stock on delete). LubricantService's own purchase
+        # edit/delete already refuses to let a correction drive stock
+        # negative (see update_purchase/delete_purchase); this was the one
+        # other code path writing the same column with no equivalent check
+        # at all — two Pump 2 sales racing against the same low-stock
+        # product could each pass the UI's own client-side availability
+        # check (both reading the same starting figure before either
+        # commits) and still both reach here, one after the other under
+        # this same lock, with nothing stopping the second from taking it
+        # negative.
+        if delta < 0 and resulting_stock < 0:
+            raise ConflictError(
+                f"Not enough {product.name} in stock for this sale — only {product.stock} {product.unit} "
+                "left. Reduce the count sold, or record a new purchase first."
+            )
+        product.stock = resulting_stock
         await self.session.flush()
 
     # 2T oil (machine) is a nozzle-metered fuel sale, tracked in litres via
@@ -389,11 +595,21 @@ class FuelEntryService:
             if row.product_id and row.stock_count:
                 await self._adjust_stock(row.product_id, sign * row.stock_count)
 
-    async def _remove_credit_ledger_by_source(self, entry_id: uuid.UUID) -> None:
+    # Returns whatever bill each removed row had attached, grouped by
+    # customer — see _apply_credit_ledger's own docstring-comment for why
+    # this can't just delete them outright: a bill attached here (the
+    # documented way to give a Fuel-Entry-sourced credit a receipt) must
+    # survive this same save's regeneration of these rows, not just this
+    # one removal step.
+    async def _remove_credit_ledger_by_source(self, entry_id: uuid.UUID) -> dict[uuid.UUID, list[tuple[str, str]]]:
         result = await self.session.execute(select(CreditLedgerEntry).where(CreditLedgerEntry.source_fuel_entry_id == entry_id))
+        bills_by_customer: dict[uuid.UUID, list[tuple[str, str]]] = {}
         for row in result.scalars().all():
+            if row.bill_file_url:
+                bills_by_customer.setdefault(row.customer_id, []).append((row.bill_file_name, row.bill_file_url))
             await self.session.delete(row)
         await self.session.flush()
+        return bills_by_customer
 
     async def _remove_employee_credit_by_source(self, entry_id: uuid.UUID) -> None:
         result = await self.session.execute(select(EmployeeCredit).where(EmployeeCredit.source_fuel_entry_id == entry_id))
@@ -401,17 +617,21 @@ class FuelEntryService:
             await self.session.delete(row)
         await self.session.flush()
 
-    async def _apply_side_effects(self, entry: FuelEntry) -> None:
-        await self._apply_credit_ledger(entry)
+    async def _apply_side_effects(
+        self, entry: FuelEntry, carry_forward_bills: dict[uuid.UUID, list[tuple[str, str]]] | None = None
+    ) -> None:
+        await self._apply_credit_ledger(entry, carry_forward_bills)
         await self._apply_employee_credit(entry)
+        await self._apply_shift_variance_credit(entry)
         await self._apply_oil_stock(entry, -1)
 
     # ---------- public API ----------
 
     async def create(self, data: FuelEntryWrite, actor: User) -> dict:
-        # Bill-upload requirement temporarily disabled — see update() below.
-        # if data.status == "final" and not data.bills:
-        #     raise AppError("At least one bill is required to finalize a shift entry.")
+        await self._validate_shift_employee(data)
+        if data.status == "final":
+            _validate_final_readings(data)
+            await self.period_closures.ensure_period_open(data.date.year, data.date.month)
         entry = FuelEntry(created_by=actor.id, updated_by=actor.id)
         removed_bill_keys = await self._apply_write(entry, data)
         self.session.add(entry)
@@ -427,19 +647,18 @@ class FuelEntryService:
         full = await self.entries.get_with_details(entry.id)
         await attach_actor_names(self.session, [full])
         result = await self._serialize(full)
-        # Only now, with everything else already flushed successfully (a new
-        # entry never actually has removed bills, but this stays symmetric
-        # with update() below rather than special-casing it away).
+        # Queued, not deleted now — a new entry never actually has removed
+        # bills, but this stays symmetric with update() below rather than
+        # special-casing it away. See queue_file_deletion's docstring for
+        # why this can't safely happen before the whole request commits.
         for key in removed_bill_keys:
-            delete_object(key)
+            queue_file_deletion(self.session, key)
         return result
 
     async def update(self, entry_id: uuid.UUID, data: FuelEntryWrite, actor: User) -> dict:
-        # Bill-upload requirement temporarily disabled — a fuel entry can be
-        # finalized without a bill for now. Restore these two checks (here
-        # and in create() above) to bring the requirement back.
-        # if data.status == "final" and not data.bills:
-        #     raise AppError("At least one bill is required to finalize a shift entry.")
+        await self._validate_shift_employee(data)
+        if data.status == "final":
+            _validate_final_readings(data)
         # Row-locked for the rest of this transaction — see
         # get_with_details_for_update's docstring for why: this is what
         # actually closes the concurrent-update race, the frontend-side fix
@@ -447,6 +666,14 @@ class FuelEntryService:
         existing = await self.entries.get_with_details_for_update(entry_id)
         if existing is None:
             raise NotFoundError("Fuel entry not found.")
+        # Check both the entry's current period (its employee-credit side
+        # effect, if any, is about to be reversed below) and its incoming
+        # period (a new one may be about to apply) — a final entry can't be
+        # touched in, or moved into, a closed salary month either way.
+        if existing.status == "final":
+            await self.period_closures.ensure_period_open(existing.date.year, existing.date.month)
+        if data.status == "final":
+            await self.period_closures.ensure_period_open(data.date.year, data.date.month)
         previous_month = existing.date.strftime("%Y-%m")
 
         # Reverse this entry's previous side effects before rebuilding it —
@@ -455,7 +682,7 @@ class FuelEntryService:
         # Attendance in either direction).
         if existing.status == "final":
             await self._apply_oil_stock(existing, 1)
-        await self._remove_credit_ledger_by_source(entry_id)
+        carry_forward_bills = await self._remove_credit_ledger_by_source(entry_id)
         await self._remove_employee_credit_by_source(entry_id)
 
         removed_bill_keys = await self._apply_write(existing, data)
@@ -468,18 +695,21 @@ class FuelEntryService:
             raise
 
         if data.status == "final":
-            await self._apply_side_effects(existing)
+            await self._apply_side_effects(existing, carry_forward_bills)
+        else:
+            # Un-finalizing (or a draft resaved as a draft) — no new credit
+            # rows will ever be created for this save to reclaim one of
+            # these bills onto, so whatever's here would otherwise leak.
+            await self._queue_unclaimed_bills(carry_forward_bills)
 
         invalidate_dashboard_month(previous_month)
         invalidate_dashboard_month(data.date.strftime("%Y-%m"))
         full = await self.entries.get_with_details(entry_id)
         await attach_actor_names(self.session, [full])
         result = await self._serialize(full)
-        # Only now that the flush and the side-effect cascade have both
-        # actually succeeded — see _apply_write's docstring comment on why
-        # this can't happen any earlier.
+        # Queued, not deleted now — see queue_file_deletion's docstring.
         for key in removed_bill_keys:
-            delete_object(key)
+            queue_file_deletion(self.session, key)
         return result
 
     async def delete(self, entry_id: uuid.UUID) -> None:
@@ -487,8 +717,13 @@ class FuelEntryService:
         if existing is None:
             raise NotFoundError("Fuel entry not found.")
         if existing.status == "final":
+            await self.period_closures.ensure_period_open(existing.date.year, existing.date.month)
             await self._apply_oil_stock(existing, 1)
-        await self._remove_credit_ledger_by_source(entry_id)
+        carry_forward_bills = await self._remove_credit_ledger_by_source(entry_id)
+        # The entry itself is being deleted outright — nothing will ever
+        # reclaim one of these onto a new row, so every one of them needs
+        # cleaning up here instead of leaking (see _apply_credit_ledger).
+        await self._queue_unclaimed_bills(carry_forward_bills)
         await self._remove_employee_credit_by_source(entry_id)
         bill_keys = [b.file_url for b in existing.bills]
         invalidate_dashboard_month(existing.date.strftime("%Y-%m"))
@@ -511,7 +746,7 @@ class FuelEntryService:
             if orphaned_log is not None:
                 await self.stock_logs.delete(orphaned_log)
         for key in bill_keys:
-            delete_object(key)
+            queue_file_deletion(self.session, key)
 
     async def get(self, entry_id: uuid.UUID) -> dict:
         entry = await self.entries.get_with_details(entry_id)

@@ -2,9 +2,22 @@ import uuid
 from datetime import date, datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import ORMModel
+
+# A plausibility floor, not a real business rule — same reasoning as
+# employee.py's _EARLIEST_SANE_JOIN_DATE, just here to catch an obvious typo
+# (e.g. 1920 instead of 2020) at entry time.
+_EARLIEST_SANE_EXPENSE_DATE = date(1970, 1, 1)
+
+
+def _validate_expense_date(value: date) -> date:
+    if value > date.today():
+        raise ValueError("Expense date cannot be in the future")
+    if value < _EARLIEST_SANE_EXPENSE_DATE:
+        raise ValueError(f"Expense date cannot be before {_EARLIEST_SANE_EXPENSE_DATE.isoformat()}")
+    return value
 
 
 class ExpenseItemCreate(BaseModel):
@@ -22,6 +35,8 @@ class ExpenseDayCreate(BaseModel):
     date: date
     items: list[ExpenseItemCreate] = Field(min_length=1)
 
+    _validate_date = field_validator("date")(_validate_expense_date)
+
 
 class ExpenseDayUpdate(BaseModel):
     """Full replace, matching the UI: the whole item list is resubmitted on
@@ -29,6 +44,8 @@ class ExpenseDayUpdate(BaseModel):
 
     date: date
     items: list[ExpenseItemCreate] = Field(min_length=1)
+
+    _validate_date = field_validator("date")(_validate_expense_date)
 
 
 class ExpenseDayOut(ORMModel):

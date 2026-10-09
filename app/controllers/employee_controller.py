@@ -13,6 +13,8 @@ from app.schemas.employee import (
     EmployeeOut,
     EmployeeUpdate,
     SalaryHistoryCreate,
+    SalaryPaymentCreate,
+    SalaryPaymentUpdate,
 )
 from app.services.employee_service import EmployeeService
 
@@ -131,3 +133,41 @@ async def delete_employee_credit(
     service = EmployeeService(session)
     await service.delete_credit(employee_id, credit_id)
     return Message(detail="Employee credit deleted.")
+
+
+@router.post("/{employee_id}/payments", response_model=EmployeeOut, status_code=status.HTTP_201_CREATED)
+async def add_salary_payment(
+    employee_id: uuid.UUID,
+    body: SalaryPaymentCreate,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_manager_or_admin),
+) -> EmployeeOut:
+    service = EmployeeService(session)
+    employee = await service.add_payment(employee_id, body, current_user)
+    return EmployeeOut.model_validate(employee)
+
+
+@router.patch("/{employee_id}/payments/{payment_id}", response_model=EmployeeOut)
+async def update_salary_payment(
+    employee_id: uuid.UUID,
+    payment_id: uuid.UUID,
+    body: SalaryPaymentUpdate,
+    session: AsyncSession = Depends(get_db_session),
+    current_user: User = Depends(require_manager_or_admin),
+) -> EmployeeOut:
+    service = EmployeeService(session)
+    employee = await service.update_payment(employee_id, payment_id, body, current_user)
+    return EmployeeOut.model_validate(employee)
+
+
+@router.delete(
+    "/{employee_id}/payments/{payment_id}",
+    response_model=Message,
+    dependencies=[Depends(require_manager_or_admin)],
+)
+async def delete_salary_payment(
+    employee_id: uuid.UUID, payment_id: uuid.UUID, session: AsyncSession = Depends(get_db_session)
+) -> Message:
+    service = EmployeeService(session)
+    await service.delete_payment(employee_id, payment_id)
+    return Message(detail="Salary payment deleted.")

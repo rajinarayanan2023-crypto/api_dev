@@ -113,7 +113,7 @@ async def delete_ledger_entry(
 @router.post("/{customer_id}/send-reminder", response_model=Message)
 async def send_credit_reminder(
     customer_id: uuid.UUID,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_manager_or_admin),
     session: AsyncSession = Depends(get_db_session),
 ) -> Message:
     service = CreditCustomerService(session)
@@ -125,7 +125,7 @@ async def send_credit_reminder(
 async def send_ledger_entry_reminder(
     customer_id: uuid.UUID,
     entry_id: uuid.UUID,
-    current_user: User = Depends(get_current_active_user),
+    current_user: User = Depends(require_manager_or_admin),
     session: AsyncSession = Depends(get_db_session),
 ) -> Message:
     service = CreditCustomerService(session)

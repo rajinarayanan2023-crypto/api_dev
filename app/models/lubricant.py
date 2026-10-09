@@ -21,17 +21,19 @@ class LubricantProduct(Base, UUIDPkMixin, AuditMixin):
     # here are whole-unit packets/cans.
     stock: Mapped[Decimal] = mapped_column(Numeric(12, 3), nullable=False, server_default=text("0"))
 
-    price_history: Mapped[list["LubricantPriceHistory"]] = relationship(
-        back_populates="product", cascade="all, delete-orphan", order_by="LubricantPriceHistory.effective_from"
-    )
     purchase_history: Mapped[list["LubricantPurchaseHistory"]] = relationship(
         back_populates="product", cascade="all, delete-orphan", order_by="LubricantPurchaseHistory.date"
     )
 
 
-class LubricantPriceHistory(Base, UUIDPkMixin):
-    """Sale rate in force on any date = latest row with effective_from <= that date."""
-
+# The app no longer reads or writes this table (the "Revise Price" feature
+# it backed was removed as a purely display-only concern isolated to the
+# Lubricants page — Pump 2's oil pricing has always been driven entirely by
+# LubricantPurchaseHistory's cost, a separate table). The model stays
+# registered here, with no relationship back from LubricantProduct, so that
+# an `alembic revision --autogenerate` run against this metadata doesn't
+# propose dropping the still-existing Lubricant_Price_History table/rows.
+class LubricantPriceHistory(Base, UUIDPkMixin, AuditMixin):
     __tablename__ = "Lubricant_Price_History"
     __table_args__ = (
         UniqueConstraint("product_id", "effective_from", name="uq_lubricant_price_history"),
@@ -43,12 +45,16 @@ class LubricantPriceHistory(Base, UUIDPkMixin):
     )
     rate: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     effective_from: Mapped[date] = mapped_column(Date, nullable=False)
+    previous_rate: Mapped[Decimal | None] = mapped_column(Numeric(10, 2))
 
-    product: Mapped["LubricantProduct"] = relationship(back_populates="price_history")
 
+class LubricantPurchaseHistory(Base, UUIDPkMixin, AuditMixin):
+    """Every restock — acquisition cost, separate from the sale rate above.
 
-class LubricantPurchaseHistory(Base, UUIDPkMixin):
-    """Every restock — acquisition cost, separate from the sale rate above."""
+    Gained AuditMixin for the same reason as LubricantPriceHistory above —
+    an acquisition cost worth reconciling later is worth knowing who entered
+    it and when.
+    """
 
     __tablename__ = "Lubricant_Purchase_History"
     __table_args__ = (Index("idx_lubricant_purchase_history_product", "product_id", "date"),)

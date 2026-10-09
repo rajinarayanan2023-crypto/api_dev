@@ -10,7 +10,12 @@ from app.schemas.common import ORMModel
 # OfferService.send, which now always writes "whatsapp"); kept here so
 # OfferSendOut can still deserialize/display old rows correctly.
 Channel = Literal["sms", "whatsapp"]
-RecipientStatus = Literal["pending", "sent", "failed", "blocked"]
+# "delivered"/"read" only ever get set by the webhook, once Meta actually
+# confirms the customer's phone received/opened it — a send itself only
+# ever produces "sent" (accepted by Meta), "failed", or "blocked" (no phone
+# on file). See OfferSendRecipient's wa_message_id for how a webhook event
+# gets matched back to the row it updates.
+RecipientStatus = Literal["pending", "sent", "delivered", "read", "failed", "blocked"]
 
 
 class OfferSendCreate(BaseModel):

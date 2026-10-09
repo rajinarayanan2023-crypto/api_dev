@@ -48,6 +48,16 @@ class Settings(BaseSettings):
     rate_limit_login: str = "5/minute"
     rate_limit_default: str = "100/minute"
 
+    # --- Account lockout (see app/services/login_attempt_service.py) ---
+    # Per-IP rate limiting (above) can't catch many different IPs each
+    # trying a few passwords against the SAME account — this is keyed by
+    # identifier instead, straight off the Login_Attempts table, regardless
+    # of which IP is asking. Applies to both /auth/login (guessing a user's
+    # password) and /auth/change-password (guessing an authenticated
+    # session's current password) — same shape of attack either way.
+    login_lockout_max_failures: int = 5
+    login_lockout_window_minutes: int = 15
+
     # --- Login OTP ---
     # Expiry/max-attempts live in app/core/otp_store.py (in-memory, not DB
     # config) since they're not meant to be tuned per-deployment.

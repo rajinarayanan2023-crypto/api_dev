@@ -7,7 +7,7 @@ from sqlalchemy.orm import selectinload
 from app.models.employee import Employee, EmployeeSalaryHistory
 from app.repositories.base import BaseRepository
 
-_WITH_DETAIL = (selectinload(Employee.salary_history), selectinload(Employee.credits))
+_WITH_DETAIL = (selectinload(Employee.salary_history), selectinload(Employee.credits), selectinload(Employee.payments))
 
 
 class EmployeeRepository(BaseRepository[Employee]):

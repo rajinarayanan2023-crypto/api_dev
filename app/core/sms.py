@@ -47,16 +47,22 @@ class WhatsAppSendError(AppError):
 
 
 class WhatsAppProvider(ABC):
+    # Returns Meta's own message_id (None for DevLogWhatsAppProvider, which
+    # never actually calls Meta) — callers that need to later match a
+    # webhook delivery-status event back to the specific recipient/row that
+    # triggered it (see OfferService.send, whatsapp_webhook_controller.py)
+    # persist this; callers that don't care are free to ignore the return
+    # value, same as before this was added.
     @abstractmethod
-    async def send(self, to_phone: str | None, message: str) -> None: ...
+    async def send(self, to_phone: str | None, message: str) -> str | None: ...
 
     # Alias for send() — same thing, named to read clearly next to
     # send_document() below at call sites that send either kind.
-    async def send_text(self, to_phone: str | None, message: str) -> None:
-        await self.send(to_phone, message)
+    async def send_text(self, to_phone: str | None, message: str) -> str | None:
+        return await self.send(to_phone, message)
 
     @abstractmethod
-    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> None: ...
+    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> str | None: ...
 
     # send/send_document above only work within WhatsApp's 24h customer-
     # initiated window — confirmed via real testing (Meta accepts the
@@ -73,7 +79,7 @@ class WhatsAppProvider(ABC):
         variables: list[str],
         document_url: str | None = None,
         document_filename: str | None = None,
-    ) -> None: ...
+    ) -> str | None: ...
 
     # Fetches the template's real approved body text + review status
     # straight from Meta, rather than keeping a second, hand-copied version
@@ -92,10 +98,11 @@ class DevLogWhatsAppProvider(WhatsAppProvider):
     the real API or sends a real message to a real customer.
     """
 
-    async def send(self, to_phone: str | None, message: str) -> None:
+    async def send(self, to_phone: str | None, message: str) -> str | None:
         logger.warning("DEV WhatsApp to %s: %s", to_phone or "(no phone on file)", message)
+        return None
 
-    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> None:
+    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> str | None:
         logger.warning(
             "DEV WhatsApp document to %s: %s (file: %s, %s)",
             to_phone or "(no phone on file)",
@@ -103,6 +110,7 @@ class DevLogWhatsAppProvider(WhatsAppProvider):
             filename,
             document_url,
         )
+        return None
 
     async def send_template(
         self,
@@ -112,7 +120,7 @@ class DevLogWhatsAppProvider(WhatsAppProvider):
         variables: list[str],
         document_url: str | None = None,
         document_filename: str | None = None,
-    ) -> None:
+    ) -> str | None:
         logger.warning(
             "DEV WhatsApp template to %s: %s (%s) vars=%s doc=%s",
             to_phone or "(no phone on file)",
@@ -121,6 +129,7 @@ class DevLogWhatsAppProvider(WhatsAppProvider):
             variables,
             document_url,
         )
+        return None
 
     async def get_template_info(self, template_name: str, language_code: str) -> dict:
         return {
@@ -164,7 +173,7 @@ class MetaWhatsAppProvider(WhatsAppProvider):
                 "META_WHATSAPP_PHONE_NUMBER_ID to send real WhatsApp messages."
             )
 
-    async def _post(self, payload: dict, to_phone: str) -> None:
+    async def _post(self, payload: dict, to_phone: str) -> str | None:
         try:
             async with httpx.AsyncClient(timeout=_META_TIMEOUT_SECONDS) as client:
                 response = await client.post(self._url(), json=payload, headers=self._headers())
@@ -204,8 +213,9 @@ class MetaWhatsAppProvider(WhatsAppProvider):
             messages = body.get("messages") or []
             message_id = messages[0].get("id") if messages else None
         logger.info("Meta WhatsApp send to %s ok — message_id=%s", to_phone, message_id)
+        return message_id
 
-    async def send(self, to_phone: str | None, message: str) -> None:
+    async def send(self, to_phone: str | None, message: str) -> str | None:
         self._check_configured()
         if not to_phone:
             raise WhatsAppSendError("No phone number on file for this recipient.")
@@ -216,9 +226,9 @@ class MetaWhatsAppProvider(WhatsAppProvider):
             "type": "text",
             "text": {"body": message},
         }
-        await self._post(payload, formatted)
+        return await self._post(payload, formatted)
 
-    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> None:
+    async def send_document(self, to_phone: str | None, message: str, document_url: str, filename: str) -> str | None:
         self._check_configured()
         if not to_phone:
             raise WhatsAppSendError("No phone number on file for this recipient.")
@@ -229,7 +239,7 @@ class MetaWhatsAppProvider(WhatsAppProvider):
             "type": "document",
             "document": {"link": document_url, "filename": filename, "caption": message},
         }
-        await self._post(payload, formatted)
+        return await self._post(payload, formatted)
 
     async def send_template(
         self,
@@ -239,7 +249,7 @@ class MetaWhatsAppProvider(WhatsAppProvider):
         variables: list[str],
         document_url: str | None = None,
         document_filename: str | None = None,
-    ) -> None:
+    ) -> str | None:
         self._check_configured()
         if not to_phone:
             raise WhatsAppSendError("No phone number on file for this recipient.")
@@ -274,7 +284,7 @@ class MetaWhatsAppProvider(WhatsAppProvider):
                 "components": components,
             },
         }
-        await self._post(payload, formatted)
+        return await self._post(payload, formatted)
 
     async def get_template_info(self, template_name: str, language_code: str) -> dict:
         self._check_configured()

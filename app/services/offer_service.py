@@ -98,11 +98,17 @@ class OfferService:
                     # template. {{1}} station name, {{2}} the one
                     # offer-specific value, matching the order OFFER_TEMPLATES'
                     # own submitted body text references them in.
-                    await provider.send_template(
+                    message_id = await provider.send_template(
                         phone, template["name"], template["language"], [station.name, data.offer_variable]
                     )
                     recipient.status = "sent"
                     recipient.sent_at = datetime.now(timezone.utc)
+                    # The only thing a later webhook delivery-status event
+                    # can be matched back to this row by (see
+                    # whatsapp_webhook_controller.py) — None for
+                    # DevLogWhatsAppProvider, where no real message exists to
+                    # ever get a status callback for.
+                    recipient.wa_message_id = message_id
                 except Exception as exc:  # noqa: BLE001 — recorded per-recipient, not raised
                     recipient.status = "failed"
                     recipient.provider_response = str(exc)
@@ -144,3 +150,26 @@ class OfferService:
         await attach_actor_names(self.session, sends)
         _attach_status_counts(sends)
         return sends
+
+    async def update_delivery_status(self, wa_message_id: str, status: str, error_detail: str | None) -> bool:
+        """Called from the WhatsApp webhook (whatsapp_webhook_controller.py)
+        whenever Meta reports a real delivery-status change — this is the
+        only place "sent" (accepted by Meta) ever becomes "delivered"/"read"
+        (actually reached the customer's phone), or "failed" after the fact
+        (Meta accepted it but delivery later bounced). Returns False if no
+        recipient row matches this message_id (e.g. a webhook event for a
+        send made before wa_message_id existed, or a duplicate/replayed
+        event after the row's own offer_send was deleted) — the caller logs
+        that, never raises, since a webhook must always answer 200 either way.
+        """
+        result = await self.session.execute(
+            select(OfferSendRecipient).where(OfferSendRecipient.wa_message_id == wa_message_id)
+        )
+        recipient = result.scalar_one_or_none()
+        if recipient is None:
+            return False
+        recipient.status = status
+        if error_detail:
+            recipient.provider_response = error_detail
+        await self.session.commit()
+        return True

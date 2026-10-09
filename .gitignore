@@ -12,3 +12,7 @@ backups/
 uploads/
 .venv-win/
 uvicorn*.log
+.uvicorn*.log
+api_stdout.log
+api_stderr.log
+verify*.log

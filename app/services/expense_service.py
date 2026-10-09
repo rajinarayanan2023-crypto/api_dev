@@ -1,5 +1,6 @@
 import uuid
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.cache import invalidate_dashboard_month
@@ -9,21 +10,34 @@ from app.models.user import User
 from app.repositories.expense_repository import ExpenseDayRepository
 from app.schemas.expense import ExpenseDayCreate, ExpenseDayUpdate
 from app.services.audit import attach_actor_names
+from app.services.salary_period_closure_service import SalaryPeriodClosureService
 
 
 class ExpenseService:
     def __init__(self, session: AsyncSession):
         self.session = session
         self.expense_days = ExpenseDayRepository(session)
+        self.period_closures = SalaryPeriodClosureService(session)
 
     async def create_expense_day(self, data: ExpenseDayCreate, actor: User) -> ExpenseDay:
         existing = await self.expense_days.get_by_date(data.date)
         if existing is not None:
             raise ConflictError("An expense record for this date already exists.")
+        await self.period_closures.ensure_period_open(data.date.year, data.date.month)
 
         day = ExpenseDay(date=data.date, created_by=actor.id, updated_by=actor.id)
         day.items = [ExpenseItem(label=item.label, amount=item.amount) for item in data.items]
-        created = await self.expense_days.create(day)
+        try:
+            created = await self.expense_days.create(day)
+        except IntegrityError as exc:
+            # Two "create expense day" requests racing for the same date
+            # both pass the "existing is None" check above before either has
+            # saved — the table's own unique constraint catches the second
+            # one; without this, that surfaced as a raw 500 instead of the
+            # same clean message the non-racing case already gets above.
+            if "Expense_Days_date_key" in str(exc):
+                raise ConflictError("An expense record for this date already exists.") from exc
+            raise
         invalidate_dashboard_month(created.date.strftime("%Y-%m"))
         return await self.get_expense_day(created.id)
 
@@ -43,6 +57,13 @@ class ExpenseService:
         day = await self.get_expense_day(expense_day_id)
         previous_month = day.date.strftime("%Y-%m")
 
+        # Check both the day's current period (editing its items is still a
+        # change to a closed month's numbers) and its incoming period if the
+        # date is moving (can't move a day's expenses into a closed month
+        # either) — same reasoning as the analogous credit/payment guards.
+        for check_date in {day.date, data.date}:
+            await self.period_closures.ensure_period_open(check_date.year, check_date.month)
+
         if data.date != day.date:
             existing = await self.expense_days.get_by_date(data.date)
             if existing is not None and existing.id != day.id:
@@ -61,5 +82,6 @@ class ExpenseService:
 
     async def delete_expense_day(self, expense_day_id: uuid.UUID) -> None:
         day = await self.get_expense_day(expense_day_id)
+        await self.period_closures.ensure_period_open(day.date.year, day.date.month)
         invalidate_dashboard_month(day.date.strftime("%Y-%m"))
         await self.expense_days.delete(day)

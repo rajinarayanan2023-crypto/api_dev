@@ -72,8 +72,20 @@ class OfferSendRecipient(Base, UUIDPkMixin):
 
     __tablename__ = "Offer_Send_Recipients"
     __table_args__ = (
-        CheckConstraint("status IN ('pending', 'sent', 'failed', 'blocked')", name="ck_offer_send_recipients_status"),
+        # 'delivered'/'read' only ever get set by the webhook (see
+        # whatsapp_webhook_controller.py), never by OfferService.send itself
+        # — a send only ever writes 'sent'/'failed'/'blocked' at request
+        # time, since Meta accepting the request is not the same as the
+        # customer's phone actually receiving it.
+        CheckConstraint(
+            "status IN ('pending', 'sent', 'delivered', 'read', 'failed', 'blocked')",
+            name="ck_offer_send_recipients_status",
+        ),
         Index("idx_offer_send_recipients_send", "offer_send_id"),
+        # Looked up by the webhook on every delivery-status event (keyed by
+        # Meta's own message id) — needs to be fast, and unique since a
+        # message_id can only ever belong to one send.
+        Index("idx_offer_send_recipients_wa_message_id", "wa_message_id", unique=True),
     )
 
     offer_send_id: Mapped[uuid.UUID] = mapped_column(
@@ -86,6 +98,12 @@ class OfferSendRecipient(Base, UUIDPkMixin):
     # id on success) — kept simple rather than a JSON column since neither
     # provider here is a real integration yet (see core/sms.py).
     provider_response: Mapped[str | None] = mapped_column(Text)
+    # Meta's own id for the outbound message — the ONLY thing a later
+    # webhook delivery-status event ("delivered"/"read"/"failed", see
+    # whatsapp_webhook_controller.py) can be matched back to this specific
+    # row by. Null for a send that failed before Meta ever returned an id,
+    # or one made via DevLogWhatsAppProvider (no real message exists).
+    wa_message_id: Mapped[str | None] = mapped_column(Text)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
 

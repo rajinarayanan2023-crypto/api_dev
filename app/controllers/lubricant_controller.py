@@ -10,7 +10,6 @@ from app.schemas.lubricant import (
     LubricantCreate,
     LubricantOut,
     LubricantUpdate,
-    PriceHistoryCreate,
     PurchaseCreate,
     PurchaseUpdate,
     SoldHistoryEntryOut,
@@ -63,30 +62,6 @@ async def update_lubricant(
     return LubricantOut.model_validate(product)
 
 
-@router.post("/{product_id}/price-history", response_model=LubricantOut)
-async def add_price_revision(
-    product_id: uuid.UUID,
-    body: PriceHistoryCreate,
-    session: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_manager_or_admin),
-) -> LubricantOut:
-    service = LubricantService(session)
-    product = await service.add_price_revision(product_id, body, current_user)
-    return LubricantOut.model_validate(product)
-
-
-@router.delete("/{product_id}/price-history/{revision_id}", response_model=LubricantOut)
-async def delete_price_revision(
-    product_id: uuid.UUID,
-    revision_id: uuid.UUID,
-    session: AsyncSession = Depends(get_db_session),
-    current_user: User = Depends(require_manager_or_admin),
-) -> LubricantOut:
-    service = LubricantService(session)
-    product = await service.delete_price_revision(product_id, revision_id, current_user)
-    return LubricantOut.model_validate(product)
-
-
 @router.post("/{product_id}/purchases", response_model=LubricantOut)
 async def add_purchase(
     product_id: uuid.UUID,
@@ -126,10 +101,13 @@ async def delete_purchase(
 
 @router.get("/{product_id}/sales-history", response_model=list[SoldHistoryEntryOut])
 async def get_sales_history(
-    product_id: uuid.UUID, session: AsyncSession = Depends(get_db_session)
+    product_id: uuid.UUID,
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=500),
+    session: AsyncSession = Depends(get_db_session),
 ) -> list[SoldHistoryEntryOut]:
     service = LubricantService(session)
-    rows = await service.get_sales_history(product_id)
+    rows = await service.get_sales_history(product_id, offset=offset, limit=limit)
     return [SoldHistoryEntryOut.model_validate(r) for r in rows]
 
 

@@ -3,12 +3,25 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import ORMModel
 
 LedgerType = Literal["credit", "payment"]
 FuelType = Literal["petrol", "diesel", "oil"]
+
+# A plausibility floor, not a real business rule — same reasoning as
+# employee.py's _EARLIEST_SANE_JOIN_DATE, just here to catch an obvious typo
+# (e.g. 1920 instead of 2020) at entry time.
+_EARLIEST_SANE_LEDGER_DATE = date(1970, 1, 1)
+
+
+def _validate_ledger_date(value: date) -> date:
+    if value > date.today():
+        raise ValueError("Transaction date cannot be in the future")
+    if value < _EARLIEST_SANE_LEDGER_DATE:
+        raise ValueError(f"Transaction date cannot be before {_EARLIEST_SANE_LEDGER_DATE.isoformat()}")
+    return value
 
 
 # file_url (here and on CreditLedgerEntryCreate/Out's bill_file_url) holds
@@ -42,6 +55,8 @@ class CreditLedgerEntryCreate(BaseModel):
     bill_file_name: str | None = None
     bill_file_url: str | None = None
 
+    _validate_date = field_validator("date")(_validate_ledger_date)
+
 
 # Attaches/replaces/clears the bill on an EXISTING ledger entry — the entry
 # itself (amount/date/reason) is immutable once recorded, but a credit
@@ -70,6 +85,11 @@ class CreditLedgerEntryOut(ORMModel):
     bill_file_name: str | None = None
     bill_file_url: str | None = None
     created_at: datetime
+    updated_at: datetime
+    created_by: uuid.UUID | None = None
+    created_by_name: str | None = None
+    updated_by: uuid.UUID | None = None
+    updated_by_name: str | None = None
 
 
 class CreditCustomerCreate(BaseModel):

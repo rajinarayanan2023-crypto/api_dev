@@ -120,7 +120,13 @@ class DashboardService:
             "commission_earned": commission_earned,
             "total_expenses": total_expenses,
             "profit": profit,
-            "rate_status": "no_rates_configured" if not rates else "using_historical_rates",
+            # Whether a flat rate actually covered the month being viewed —
+            # not just whether one exists anywhere in time. A station whose
+            # first-ever rate took effect partway through its fuel-entry
+            # history otherwise saw this as "using_historical_rates" even for
+            # months before that rate existed, hiding the "no rate was set
+            # yet" banner exactly when it mattered most.
+            "rate_status": "no_rates_configured" if _rate_for_date(rates, end) is None else "using_historical_rates",
         }
         dashboard_cache.set(cache_key, summary)
         return summary

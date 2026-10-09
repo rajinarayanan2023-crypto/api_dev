@@ -17,11 +17,11 @@ class AttendanceBase(BaseModel):
 
 # Only for user-submitted writes through this page's own API — a manager
 # marking attendance by hand always has (or omits) a real start time. Not on
-# AttendanceOut: reading back a row re-validating it as if it were a fresh
-# submission is backwards — a row written by a different path entirely (Fuel
-# Entry's auto-mark cascade goes straight through the repository, and has no
-# start_time concept at all) is still a true fact about the database, and a
-# GET must never 500 over how some other path chose to write it.
+# AttendanceOut: reading an existing row back out and re-validating it as if
+# it were a fresh submission is backwards — a row already on record is a true
+# fact about the database regardless of this rule, and a GET must never 500
+# just because this rule didn't exist (or looked different) when that row was
+# originally written.
 class _RequiresStartTimeForShifts:
     @model_validator(mode="after")
     def start_time_only_for_shifts(self):

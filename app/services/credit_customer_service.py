@@ -4,8 +4,9 @@ from decimal import Decimal
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.database import queue_file_deletion
 from app.core.exceptions import ConflictError, NotFoundError
-from app.core.s3 import delete_object, get_download_presigned_url
+from app.core.s3 import get_download_presigned_url
 from app.core.sms import get_whatsapp_provider
 from app.models.credit import CreditCustomer, CreditCustomerBill, CreditLedgerEntry
 from app.models.user import User
@@ -76,6 +77,7 @@ class CreditCustomerService:
     async def list_all(self, offset: int = 0, limit: int = 500) -> list[CreditCustomer]:
         customers = await self.customers.list_with_details(offset=offset, limit=limit)
         await attach_actor_names(self.session, customers)
+        await attach_actor_names(self.session, [e for c in customers for e in c.ledger_entries])
         _attach_closing_balance(customers)
         return customers
 
@@ -84,6 +86,7 @@ class CreditCustomerService:
         if customer is None:
             raise NotFoundError("Credit customer not found.")
         await attach_actor_names(self.session, [customer])
+        await attach_actor_names(self.session, customer.ledger_entries)
         _attach_closing_balance([customer])
         return customer
 
@@ -111,8 +114,15 @@ class CreditCustomerService:
         if updates or data.bills is not None:
             customer.updated_by = actor.id
         await self.session.flush()
+        # Deferred until this request's transaction actually commits — see
+        # queue_file_deletion's own docstring. A bare, immediate delete_object
+        # here (what this used to do) would survive a later failure in this
+        # same request (e.g. the get() re-fetch below, or the commit itself)
+        # that rolls the DB change back, leaving `customer.bills` pointing at
+        # a file this already deleted for real — the exact same dangling
+        # reference as PumpDayEditor's own remove-bill-without-saving gap.
         for key in removed_keys:
-            delete_object(key)
+            queue_file_deletion(self.session, key)
         return await self.get(customer_id)
 
     async def delete(self, customer_id: uuid.UUID) -> None:
@@ -140,12 +150,25 @@ class CreditCustomerService:
         bill_keys += [e.bill_file_url for e in customer.ledger_entries if e.bill_file_url]
         await self.customers.delete(customer)
         for key in bill_keys:
-            delete_object(key)
+            queue_file_deletion(self.session, key)
 
     async def add_ledger_entry(self, customer_id: uuid.UUID, data: CreditLedgerEntryCreate, actor: User) -> CreditCustomer:
+        # Locked BEFORE the duplicate check (not after) — otherwise two
+        # requests racing at the same instant could both pass the check
+        # before either has saved, which is exactly the scenario this is
+        # meant to close.
+        await self.customers.lock_for_update(customer_id)
         customer = await self.customers.get_with_details(customer_id)
         if customer is None:
             raise NotFoundError("Credit customer not found.")
+        recent_duplicate = await self.customers.get_recent_duplicate_ledger_entry(
+            customer_id, data.type, data.date, data.amount
+        )
+        if recent_duplicate is not None:
+            raise ConflictError(
+                "This looks like a duplicate — an identical entry for this customer was just recorded a "
+                "moment ago. Refresh and check the transaction history before adding it again."
+            )
         entry = CreditLedgerEntry(
             date=data.date,
             type=data.type,
@@ -157,6 +180,8 @@ class CreditCustomerService:
             note=data.note,
             bill_file_name=data.bill_file_name,
             bill_file_url=data.bill_file_url,
+            created_by=actor.id,
+            updated_by=actor.id,
         )
         # Appending to the relationship (rather than session.add(entry) with
         # customer_id set directly) is what keeps the already-loaded
@@ -179,11 +204,17 @@ class CreditCustomerService:
         old_key = entry.bill_file_url
         entry.bill_file_name = data.bill_file_name
         entry.bill_file_url = data.bill_file_url
+        entry.updated_by = actor.id
         customer = await self.customers.get_with_details(customer_id)
         customer.updated_by = actor.id
         await self.session.flush()
+        # Deferred until commit (see queue_file_deletion) — an immediate
+        # delete_object here (the bare S3 helper) was the gap: a failure
+        # between this flush() and the eventual commit (the get() re-fetch
+        # below, or the commit itself) rolls entry.bill_file_url back to
+        # old_key, but the object at old_key would already be gone for real.
         if old_key and old_key != entry.bill_file_url:
-            delete_object(old_key)
+            queue_file_deletion(self.session, old_key)
         return await self.get(customer_id)
 
     # Mirrors the UI's own rule (see CreditBills.jsx) — an entry created from
@@ -199,7 +230,7 @@ class CreditCustomerService:
         await self.session.delete(entry)
         await self.session.flush()
         if bill_key:
-            delete_object(bill_key)
+            queue_file_deletion(self.session, bill_key)
 
     async def _send_credit_reminder_template(
         self, customer: CreditCustomer, bill_file_url: str | None, bill_file_name: str | None
