@@ -1,4 +1,5 @@
 from app.models.attendance import AttendanceRecord, AttendanceStatus
+from app.models.audit_email_send import AuditEmailSend
 from app.models.commission import CommissionRateHistory
 from app.models.credit import CreditCustomer, CreditCustomerBill, CreditLedgerEntry
 from app.models.employee import (
@@ -22,6 +23,7 @@ from app.models.user import User, UserRole
 __all__ = [
     "AttendanceRecord",
     "AttendanceStatus",
+    "AuditEmailSend",
     "CommissionRateHistory",
     "CreditCustomer",
     "CreditCustomerBill",
